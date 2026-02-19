@@ -1,0 +1,25 @@
+[package]
+name = "huskarl-google-cloud"
+version = "0.1.0"
+edition = "2024"
+description = "Google Cloud support for huskarl (OAuth2 client) ecosystem."
+repository = "https://github.com/huskarl-rs/huskarl-google-cloud"
+license = "MIT OR Apache-2.0"
+keywords = ["oauth2", "security", "authentication", "gcp", "google"]
+categories = ["authentication"]
+readme = "README.md"
+
+[features]
+default = ["kms", "secretmanager"]
+kms = ["dep:google-cloud-kms-v1"]
+secretmanager = ["dep:google-cloud-secretmanager-v1"]
+
+[dependencies]
+huskarl-core = { version = "0.1", default-features = false }
+
+bon = { version = "3", default-features = false }
+google-cloud-kms-v1 = { version = "1.4", optional = true, default-features = false }
+google-cloud-secretmanager-v1 = { version = "1.4", optional = true, default-features = false }
+p256 = { version = "0.14.0-rc.8", default-features = false, features = ["ecdsa-core"] }
+p384 = { version = "0.14.0-rc.8", default-features = false, features = ["ecdsa-core"] }
+snafu = { version = "0.9", default-features = false, features = ["std", "rust_1_81"] }
