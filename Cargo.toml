@@ -11,15 +11,15 @@ readme = "README.md"
 
 [features]
 default = ["kms", "secretmanager"]
-kms = ["dep:google-cloud-kms-v1"]
+kms = ["dep:google-cloud-kms-v1", "dep:p256", "dep:p384"]
 secretmanager = ["dep:google-cloud-secretmanager-v1"]
 
 [dependencies]
-huskarl-core = { version = "0.1", default-features = false }
+huskarl-core = { version = "0.4", default-features = false }
 
 bon = { version = "3", default-features = false }
 google-cloud-kms-v1 = { version = "1.4", optional = true, default-features = false }
 google-cloud-secretmanager-v1 = { version = "1.4", optional = true, default-features = false }
-p256 = { version = "0.14.0-rc.8", default-features = false, features = ["ecdsa-core"] }
-p384 = { version = "0.14.0-rc.8", default-features = false, features = ["ecdsa-core"] }
+p256 = { version = "=0.14.0-rc.9", optional = true, default-features = false, features = ["ecdsa", "pem"] }
+p384 = { version = "=0.14.0-rc.9", optional = true, default-features = false, features = ["ecdsa", "pem"] }
 snafu = { version = "0.9", default-features = false, features = ["std", "rust_1_81"] }
