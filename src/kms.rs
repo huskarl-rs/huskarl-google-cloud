@@ -202,11 +202,8 @@ impl AsymmetricJwsKey {
 
         let key_id = with_kid_from_key_version.map(|f| f(&resolved_key_version));
 
-        let jws_algorithm = get_jws_algorithm_for_resource(
-            &kms_client,
-            &resolved_key_version_name,
-        )
-        .await?;
+        let jws_algorithm =
+            get_jws_algorithm_for_resource(&kms_client, &resolved_key_version_name).await?;
 
         Ok(Self {
             kms_client,
@@ -347,17 +344,16 @@ impl AsymmetricJwsKeyPair {
             .await
             .context(GetPublicKeySnafu)?;
 
-        let jws_algorithm = get_jws_algorithm(&public_key_response.algorithm)
-            .with_context(|| UnsupportedAlgorithmSnafu {
-                algorithm: public_key_response.algorithm,
+        let jws_algorithm =
+            get_jws_algorithm(&public_key_response.algorithm).with_context(|| {
+                UnsupportedAlgorithmSnafu {
+                    algorithm: public_key_response.algorithm,
+                }
             })?;
 
-        let public_key_jwk = parse_ec_public_key_pem(
-            &public_key_response.pem,
-            jws_algorithm,
-            key_id.as_deref(),
-        )
-        .context(PublicKeyParseSnafu)?;
+        let public_key_jwk =
+            parse_ec_public_key_pem(&public_key_response.pem, jws_algorithm, key_id.as_deref())
+                .context(PublicKeyParseSnafu)?;
 
         let thumbprint = public_key_jwk.thumbprint().context(PublicKeyParseSnafu)?;
 
@@ -476,11 +472,7 @@ enum EcDsaVariant {
 /// Parses an EC public key PEM (from KMS) into a [`PublicJwk`].
 ///
 /// Returns `None` if the algorithm is not a supported EC type (P-256 or P-384).
-fn parse_ec_public_key_pem(
-    pem: &str,
-    jws_algorithm: &str,
-    kid: Option<&str>,
-) -> Option<PublicJwk> {
+fn parse_ec_public_key_pem(pem: &str, jws_algorithm: &str, kid: Option<&str>) -> Option<PublicJwk> {
     match jws_algorithm {
         "ES256" => {
             let pk = p256::PublicKey::from_public_key_pem(pem).ok()?;

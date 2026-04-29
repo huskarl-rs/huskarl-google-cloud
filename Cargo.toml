@@ -1,6 +1,6 @@
 [package]
 name = "huskarl-google-cloud"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Google Cloud support for huskarl (OAuth2 client) ecosystem."
 repository = "https://github.com/huskarl-rs/huskarl-google-cloud"

@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "huskarl-google-cloud"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bon",
  "google-cloud-kms-v1",
