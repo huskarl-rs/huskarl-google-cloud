@@ -5,6 +5,12 @@ use google_cloud_secretmanager_v1::client::SecretManagerService;
 use huskarl_core::secrets::{DecodingError, Secret, SecretDecoder, SecretOutput};
 use snafu::prelude::*;
 
+pub use versions::ActiveSecretVersions;
+pub use versions::SecretVersions;
+pub use versions::SecretVersionsError;
+
+mod versions;
+
 /// Errors that can occur when using the Google Cloud Secret Manager API.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
@@ -34,17 +40,22 @@ impl huskarl_core::Error for SecretError {
     }
 }
 
-/// A secret value stored in Google Cloud Secret Manager.
+/// A secret pinned to a specific version in Google Cloud Secret Manager.
+///
+/// The `resource_name` should be the fully-qualified secret version resource
+/// name, e.g. `projects/p/secrets/s/versions/3`. The built-in `latest` alias
+/// (`projects/p/secrets/s/versions/latest`) and any custom aliases are also
+/// accepted.
 ///
 /// # Usage
 ///
 /// ```rust
 /// # use huskarl_core::secrets::encodings::StringEncoding;
-/// # use huskarl_google_cloud::secretmanager::SecretManagerSecret;
+/// # use huskarl_google_cloud::secretmanager::SecretVersion;
 /// # use google_cloud_secretmanager_v1::client::SecretManagerService;
 ///
 /// # async fn setup(secret_manager: SecretManagerService) {
-///   let secret = SecretManagerSecret::builder()
+///   let secret = SecretVersion::builder()
 ///   .decoder(StringEncoding)
 ///   .client(secret_manager)
 ///   .resource_name("projects/boogawooga/secrets/my-private-secret/versions/1")
@@ -52,17 +63,17 @@ impl huskarl_core::Error for SecretError {
 /// # }
 /// ```
 #[derive(Debug, Clone, Builder)]
-pub struct SecretManagerSecret<D: SecretDecoder> {
+pub struct SecretVersion<D: SecretDecoder> {
     /// The decoder applied to the secret data.
     decoder: D,
     /// The Secret Manager client used for operations.
     client: SecretManagerService,
-    /// The secret resource name (e.g. "projects/x/secrets/y/versions/z").
+    /// The secret version resource name (e.g. "projects/x/secrets/y/versions/z").
     #[builder(into)]
     resource_name: String,
 }
 
-impl<D: SecretDecoder> Secret for SecretManagerSecret<D> {
+impl<D: SecretDecoder> Secret for SecretVersion<D> {
     type Error = SecretError;
     type Output = D::Output;
 
