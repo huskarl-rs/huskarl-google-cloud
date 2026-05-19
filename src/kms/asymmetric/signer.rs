@@ -1,0 +1,874 @@
+//! Signing with asymmetric Cloud KMS keys.
+
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use bon::bon;
+use der::Decode as _;
+use google_cloud_kms_v1::{
+    client::KeyManagementService, model::crypto_key_version::CryptoKeyVersionAlgorithm,
+};
+use huskarl_core::crypto::signer::{
+    AsymmetricJwsSigner, AsymmetricJwsSignerSelector, JwsSigner, JwsSignerSelector,
+};
+use huskarl_core::jwk::{self, PublicJwk};
+use p256::ecdsa::signature;
+use p256::elliptic_curve::pkcs8::DecodePublicKey as _;
+use p256::elliptic_curve::sec1::ToSec1Point as _;
+use snafu::prelude::*;
+
+use super::super::version::VersionStrategy;
+
+type KidMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// Errors that can occur when creating a key.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum SetupError {
+    /// Failed to resolve the key version.
+    VersionResolution {
+        /// The underlying version resolution error.
+        source: super::super::version::VersionResolutionError,
+    },
+    /// The specified key uses an unsupported algorithm.
+    UnsupportedAlgorithm {
+        /// The algorithm reported by the KMS API.
+        algorithm: CryptoKeyVersionAlgorithm,
+    },
+    /// The name reported by KMS did not follow the required format.
+    InvalidKeyVersionName,
+    /// Failed to retrieve the public key from KMS.
+    GetPublicKey {
+        /// The underlying error from the KMS API.
+        source: google_cloud_kms_v1::Error,
+    },
+    /// The public key PEM could not be parsed into a JWK.
+    PublicKeyParse {
+        /// The underlying parse error.
+        source: PublicKeyParseError,
+    },
+}
+
+/// Errors that can occur when parsing a public key PEM into a JWK.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum PublicKeyParseError {
+    /// Failed to decode PEM encoding.
+    PemDecode {
+        /// The underlying PEM decoding error.
+        source: pem_rfc7468::Error,
+    },
+    /// Failed to decode an EC public key PEM.
+    #[snafu(display("failed to decode {algorithm} public key PEM"))]
+    EcDecode {
+        /// The JWS algorithm of the key.
+        algorithm: &'static str,
+        /// The underlying SPKI error.
+        source: spki::Error,
+    },
+    /// Failed to parse the SPKI structure from DER.
+    SpkiParse {
+        /// The underlying DER decoding error.
+        source: der::Error,
+    },
+    /// Failed to parse the RSA public key ASN.1 structure.
+    RsaParse {
+        /// The underlying DER decoding error.
+        source: der::Error,
+    },
+    /// Ed25519 public key has unexpected length.
+    #[snafu(display("Ed25519 public key is {length} bytes, expected 32"))]
+    Ed25519Length {
+        /// The actual length of the key bytes.
+        length: usize,
+    },
+    /// Missing EC point coordinate in the public key.
+    #[snafu(display("missing {algorithm} point coordinate"))]
+    MissingCoordinate {
+        /// The JWS algorithm of the key.
+        algorithm: &'static str,
+    },
+    /// JWK thumbprint computation failed.
+    Thumbprint,
+    /// No parser available for the given algorithm.
+    #[snafu(display("no public key parser for algorithm {algorithm}"))]
+    UnsupportedParseAlgorithm {
+        /// The algorithm that was not supported.
+        algorithm: String,
+    },
+}
+
+/// Errors that can occur when signing.
+#[derive(Debug, Snafu)]
+#[non_exhaustive]
+pub enum SigningError {
+    /// Failed to sign data with the key.
+    AsymmetricSign {
+        /// The underlying error from the KMS API.
+        source: google_cloud_kms_v1::Error,
+    },
+    /// Failed to convert ECDSA signature from DER to fixed format.
+    SignatureConversion {
+        /// Description of the conversion error.
+        source: signature::Error,
+    },
+    /// Key information in the response did not match the request.
+    ///
+    /// Key rotation/replacement probably occurred, and the caller should
+    /// reinitialize with the new version.
+    MismatchedKeyInfo,
+}
+
+impl huskarl_core::Error for SigningError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            SigningError::AsymmetricSign { source } => source.is_timeout() || source.is_exhausted(),
+            SigningError::SignatureConversion { .. } | SigningError::MismatchedKeyInfo => false,
+        }
+    }
+}
+
+// ─── KeyVersion ──────────────────────────────────────────────────────────────
+
+/// A signing key bound to a specific Cloud KMS key version.
+///
+/// This is the lowest-level signing primitive: it holds a reference to a
+/// specific `CryptoKeyVersion` resource and delegates all signing operations
+/// to Cloud KMS.
+///
+/// Implements [`JwsSigner`], [`JwsSignerSelector`] (selects itself),
+/// [`AsymmetricJwsSigner`], and [`AsymmetricJwsSignerSelector`].
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use google_cloud_kms_v1::client::KeyManagementService;
+/// use huskarl_google_cloud::kms::asymmetric::signer::KeyVersion;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error + 'static>> {
+/// let kms_client = KeyManagementService::builder().build().await?;
+/// let key = KeyVersion::builder()
+///   .resource_name("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1")
+///   .kms_client(kms_client)
+///   .build()
+///   .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct KeyVersion {
+    /// The KMS client used for operations.
+    kms_client: KeyManagementService,
+    /// The full resource name of the key version.
+    resource_name: String,
+    /// The JWS algorithm identifier (e.g. "ES256", "PS256").
+    jws_algorithm: String,
+    /// The key ID for the JWT `kid` header, if configured.
+    key_id: Option<String>,
+    /// The public key JWK.
+    public_key_jwk: PublicJwk,
+    /// The JWK thumbprint (RFC 7638).
+    thumbprint: String,
+}
+
+#[bon]
+impl KeyVersion {
+    /// Create a new `KeyVersion` from a Cloud KMS key version resource name.
+    ///
+    /// Fetches the public key and algorithm metadata from KMS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the public key could not be retrieved,
+    /// the algorithm is not supported, or the public key PEM could not
+    /// be parsed into a JWK.
+    #[builder(finish_fn = build)]
+    pub async fn builder(
+        /// The full resource name of the crypto key version.
+        #[builder(into)]
+        resource_name: String,
+        /// The KMS client used for operations.
+        kms_client: KeyManagementService,
+        /// Use the fully-specified JWS algorithm identifier for `EdDSA` keys.
+        ///
+        /// When `true` (the default), Ed25519 keys advertise `"Ed25519"` as
+        /// the JWS algorithm per [RFC 9864]. When `false`, the deprecated
+        /// polymorphic `"EdDSA"` identifier is used instead.
+        ///
+        /// This only affects signing; it has no effect on other algorithms.
+        ///
+        /// [RFC 9864]: https://www.rfc-editor.org/rfc/rfc9864
+        #[builder(default = true)]
+        use_fully_specified_jws_algorithm: bool,
+        /// Derive a kid value from the key version ID.
+        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
+        with_kid_from_key_version: Option<KidMapper>,
+    ) -> Result<Self, SetupError> {
+        build_key_version(
+            resource_name,
+            kms_client,
+            use_fully_specified_jws_algorithm,
+            with_kid_from_key_version,
+        )
+        .await
+    }
+}
+
+impl JwsSignerSelector for KeyVersion {
+    type Signer = Self;
+
+    fn select_signer(&self) -> Self::Signer {
+        self.clone()
+    }
+}
+
+impl JwsSigner for KeyVersion {
+    type Error = SigningError;
+
+    fn jws_algorithm(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.jws_algorithm)
+    }
+
+    fn key_id(&self) -> Option<Cow<'_, str>> {
+        self.key_id.as_deref().map(Cow::Borrowed)
+    }
+
+    async fn sign(&self, input: &[u8]) -> Result<Vec<u8>, Self::Error> {
+        let response = self
+            .kms_client
+            .asymmetric_sign()
+            .set_name(&self.resource_name)
+            .set_data(input.to_vec())
+            .send()
+            .await
+            .context(AsymmetricSignSnafu)?;
+
+        // Verify the response came from the expected key version.
+        ensure!(response.name == self.resource_name, MismatchedKeyInfoSnafu);
+
+        let signature = response.signature.to_vec();
+
+        // For ECDSA, KMS returns DER-encoded signatures but JWT needs
+        // fixed-size IEEE P1363 format (r || s).
+        match self.jws_algorithm.as_str() {
+            "ES256" => convert_ecdsa_der_to_fixed(&signature, EcDsaVariant::P256)
+                .context(SignatureConversionSnafu),
+            "ES384" => convert_ecdsa_der_to_fixed(&signature, EcDsaVariant::P384)
+                .context(SignatureConversionSnafu),
+            _ => Ok(signature),
+        }
+    }
+}
+
+impl AsymmetricJwsSignerSelector for KeyVersion {
+    type AsymmetricSigner = Self;
+
+    fn select_asymmetric_signer(&self) -> Self::AsymmetricSigner {
+        self.clone()
+    }
+
+    fn select_asymmetric_signer_by_thumbprint(
+        &self,
+        thumbprint: &str,
+    ) -> Option<Self::AsymmetricSigner> {
+        if self.thumbprint == thumbprint {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+}
+
+impl AsymmetricJwsSigner for KeyVersion {
+    fn public_key_jwk(&self) -> Cow<'_, PublicJwk> {
+        Cow::Borrowed(&self.public_key_jwk)
+    }
+}
+
+// ─── SigningKey ─────────────────────────────────────────────────────────────────────
+
+/// A signing key backed by a Cloud KMS `CryptoKey`.
+///
+/// Resolves a key version using the configured [`VersionStrategy`],
+/// then delegates signing to the resolved [`KeyVersion`].
+///
+/// # Examples
+///
+/// ## Latest version (default)
+///
+/// ```rust,no_run
+/// use google_cloud_kms_v1::client::KeyManagementService;
+/// use huskarl_google_cloud::kms::asymmetric::signer::SigningKey;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error + 'static>> {
+/// let kms_client = KeyManagementService::builder().build().await?;
+/// let key = SigningKey::builder()
+///   .key_name("projects/p/locations/l/keyRings/r/cryptoKeys/k")
+///   .kms_client(kms_client)
+///   .build()
+///   .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ## By label
+///
+/// ```rust,no_run
+/// use google_cloud_kms_v1::client::KeyManagementService;
+/// use huskarl_google_cloud::kms::{VersionStrategy, asymmetric::signer::SigningKey};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error + 'static>> {
+/// let kms_client = KeyManagementService::builder().build().await?;
+/// let key = SigningKey::builder()
+///   .key_name("projects/p/locations/l/keyRings/r/cryptoKeys/k")
+///   .kms_client(kms_client)
+///   .strategy(VersionStrategy::ByLabel("active_version".into()))
+///   .build()
+///   .await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct SigningKey {
+    cached_version: KeyVersion,
+}
+
+#[bon]
+impl SigningKey {
+    /// Create a new `SigningKey` from a Cloud KMS crypto key resource name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version could not be resolved, the public key
+    /// could not be retrieved, or the algorithm is not supported.
+    #[builder(finish_fn = build)]
+    pub async fn builder(
+        /// The full resource name of the crypto key.
+        #[builder(into)]
+        key_name: String,
+        /// The KMS client used for operations.
+        kms_client: KeyManagementService,
+        /// The version selection strategy. Defaults to [`VersionStrategy::Latest`].
+        #[builder(default)]
+        strategy: VersionStrategy,
+        /// Use the fully-specified JWS algorithm identifier for `EdDSA` keys.
+        ///
+        /// When `true` (the default), Ed25519 keys advertise `"Ed25519"` as
+        /// the JWS algorithm per [RFC 9864]. When `false`, the deprecated
+        /// polymorphic `"EdDSA"` identifier is used instead.
+        ///
+        /// This only affects signing; it has no effect on other algorithms.
+        ///
+        /// [RFC 9864]: https://www.rfc-editor.org/rfc/rfc9864
+        #[builder(default = true)]
+        use_fully_specified_jws_algorithm: bool,
+        /// Derive a kid value from the key version ID.
+        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
+        with_kid_from_key_version: Option<KidMapper>,
+    ) -> Result<Self, SetupError> {
+        let version_id = super::super::version::resolve_version(&key_name, &strategy, &kms_client)
+            .await
+            .context(VersionResolutionSnafu)?;
+        let version_resource_name = format!("{key_name}/cryptoKeyVersions/{version_id}");
+
+        let cached_version = build_key_version(
+            version_resource_name,
+            kms_client,
+            use_fully_specified_jws_algorithm,
+            with_kid_from_key_version,
+        )
+        .await?;
+
+        Ok(Self { cached_version })
+    }
+}
+
+impl JwsSignerSelector for SigningKey {
+    type Signer = KeyVersion;
+
+    fn select_signer(&self) -> KeyVersion {
+        self.cached_version.clone()
+    }
+}
+
+impl AsymmetricJwsSignerSelector for SigningKey {
+    type AsymmetricSigner = KeyVersion;
+
+    fn select_asymmetric_signer(&self) -> KeyVersion {
+        self.cached_version.clone()
+    }
+
+    fn select_asymmetric_signer_by_thumbprint(&self, thumbprint: &str) -> Option<KeyVersion> {
+        self.cached_version
+            .select_asymmetric_signer_by_thumbprint(thumbprint)
+    }
+}
+
+// ─── Shared construction ─────────────────────────────────────────────────────
+
+async fn build_key_version(
+    resource_name: String,
+    kms_client: KeyManagementService,
+    use_fully_specified_jws_algorithm: bool,
+    with_kid_from_key_version: Option<KidMapper>,
+) -> Result<KeyVersion, SetupError> {
+    let version_id = super::super::version::version_id_from_resource_name(&resource_name);
+    let key_id = with_kid_from_key_version.map(|f| f(version_id));
+
+    // Fetch the public key — this also gives us the algorithm.
+    let public_key_response = kms_client
+        .get_public_key()
+        .set_name(&resource_name)
+        .send()
+        .await
+        .context(GetPublicKeySnafu)?;
+
+    let jws_algorithm = get_jws_algorithm(&public_key_response.algorithm).with_context(|| {
+        UnsupportedAlgorithmSnafu {
+            algorithm: public_key_response.algorithm,
+        }
+    })?;
+
+    // For Ed25519, allow the caller to choose between the fully-specified
+    // "Ed25519" (RFC 9864) and the deprecated polymorphic "EdDSA" identifier.
+    let jws_algorithm = if !use_fully_specified_jws_algorithm && jws_algorithm == "Ed25519" {
+        "EdDSA"
+    } else {
+        jws_algorithm
+    };
+
+    let public_key_jwk = parse_public_key_pem(
+        &public_key_response.pem,
+        jws_algorithm,
+        key_id.as_deref(),
+        jwk::KeyUse::Sign,
+    )
+    .context(PublicKeyParseSnafu)?;
+
+    let thumbprint = public_key_jwk
+        .thumbprint()
+        .ok_or(PublicKeyParseError::Thumbprint)
+        .context(PublicKeyParseSnafu)?;
+
+    Ok(KeyVersion {
+        kms_client,
+        resource_name,
+        jws_algorithm: jws_algorithm.to_string(),
+        key_id,
+        public_key_jwk,
+        thumbprint,
+    })
+}
+
+// ─── Algorithm mapping ───────────────────────────────────────────────────────
+
+pub(super) fn get_jws_algorithm(algorithm: &CryptoKeyVersionAlgorithm) -> Option<&'static str> {
+    use CryptoKeyVersionAlgorithm::{
+        EcSignEd25519, EcSignP256Sha256, EcSignP384Sha384, RsaSignPkcs12048Sha256,
+        RsaSignPkcs13072Sha256, RsaSignPkcs14096Sha256, RsaSignPkcs14096Sha512,
+        RsaSignPss2048Sha256, RsaSignPss3072Sha256, RsaSignPss4096Sha256, RsaSignPss4096Sha512,
+    };
+
+    match algorithm {
+        RsaSignPss2048Sha256 | RsaSignPss3072Sha256 | RsaSignPss4096Sha256 => Some("PS256"),
+        RsaSignPss4096Sha512 => Some("PS512"),
+        RsaSignPkcs12048Sha256 | RsaSignPkcs13072Sha256 | RsaSignPkcs14096Sha256 => Some("RS256"),
+        RsaSignPkcs14096Sha512 => Some("RS512"),
+        EcSignP256Sha256 => Some("ES256"),
+        EcSignP384Sha384 => Some("ES384"),
+        EcSignEd25519 => Some("Ed25519"),
+        _ => None,
+    }
+}
+
+pub(super) fn get_jwe_algorithm(algorithm: &CryptoKeyVersionAlgorithm) -> Option<&'static str> {
+    use CryptoKeyVersionAlgorithm::{
+        RsaDecryptOaep2048Sha1, RsaDecryptOaep2048Sha256, RsaDecryptOaep3072Sha1,
+        RsaDecryptOaep3072Sha256, RsaDecryptOaep4096Sha1, RsaDecryptOaep4096Sha256,
+        RsaDecryptOaep4096Sha512,
+    };
+
+    match algorithm {
+        RsaDecryptOaep2048Sha1 | RsaDecryptOaep3072Sha1 | RsaDecryptOaep4096Sha1 => {
+            Some("RSA-OAEP")
+        }
+        RsaDecryptOaep2048Sha256 | RsaDecryptOaep3072Sha256 | RsaDecryptOaep4096Sha256 => {
+            Some("RSA-OAEP-256")
+        }
+        RsaDecryptOaep4096Sha512 => Some("RSA-OAEP-512"),
+        _ => None,
+    }
+}
+
+// ─── Public key parsing ──────────────────────────────────────────────────────
+
+/// Parses a public key PEM (from KMS) into a [`PublicJwk`].
+pub(super) fn parse_public_key_pem(
+    pem: &str,
+    algorithm: &str,
+    kid: Option<&str>,
+    key_use: jwk::KeyUse,
+) -> Result<PublicJwk, PublicKeyParseError> {
+    match algorithm {
+        "ES256" => parse_ec_p256_public_key(pem, kid, key_use),
+        "ES384" => parse_ec_p384_public_key(pem, kid, key_use),
+        "RS256" | "RS512" | "PS256" | "PS512" | "RSA-OAEP" | "RSA-OAEP-256" | "RSA-OAEP-512" => {
+            parse_rsa_public_key(pem, algorithm, kid, key_use)
+        }
+        "Ed25519" | "EdDSA" => parse_ed25519_public_key(pem, algorithm, kid, key_use),
+        _ => UnsupportedParseAlgorithmSnafu {
+            algorithm: algorithm.to_owned(),
+        }
+        .fail(),
+    }
+}
+
+fn parse_ec_p256_public_key(
+    pem: &str,
+    kid: Option<&str>,
+    key_use: jwk::KeyUse,
+) -> Result<PublicJwk, PublicKeyParseError> {
+    let pk =
+        p256::PublicKey::from_public_key_pem(pem).context(EcDecodeSnafu { algorithm: "ES256" })?;
+    let point = pk.to_sec1_point(false);
+    let x = point
+        .x()
+        .context(MissingCoordinateSnafu { algorithm: "ES256" })?;
+    let y = point
+        .y()
+        .context(MissingCoordinateSnafu { algorithm: "ES256" })?;
+    Ok(PublicJwk::builder()
+        .algorithm("ES256")
+        .maybe_kid(kid)
+        .key_use(key_use)
+        .key(
+            jwk::EcPublicKey::builder()
+                .crv("P-256")
+                .x(x.to_vec())
+                .y(y.to_vec()),
+        )
+        .build())
+}
+
+fn parse_ec_p384_public_key(
+    pem: &str,
+    kid: Option<&str>,
+    key_use: jwk::KeyUse,
+) -> Result<PublicJwk, PublicKeyParseError> {
+    let pk =
+        p384::PublicKey::from_public_key_pem(pem).context(EcDecodeSnafu { algorithm: "ES384" })?;
+    let point = pk.to_sec1_point(false);
+    let x = point
+        .x()
+        .context(MissingCoordinateSnafu { algorithm: "ES384" })?;
+    let y = point
+        .y()
+        .context(MissingCoordinateSnafu { algorithm: "ES384" })?;
+    Ok(PublicJwk::builder()
+        .algorithm("ES384")
+        .maybe_kid(kid)
+        .key_use(key_use)
+        .key(
+            jwk::EcPublicKey::builder()
+                .crv("P-384")
+                .x(x.to_vec())
+                .y(y.to_vec()),
+        )
+        .build())
+}
+
+fn parse_rsa_public_key(
+    pem: &str,
+    algorithm: &str,
+    kid: Option<&str>,
+    key_use: jwk::KeyUse,
+) -> Result<PublicJwk, PublicKeyParseError> {
+    let der_bytes = decode_pem(pem).context(PemDecodeSnafu)?;
+    let spki = spki::SubjectPublicKeyInfoRef::from_der(&der_bytes).context(SpkiParseSnafu)?;
+    let pk_bytes = spki.subject_public_key.raw_bytes();
+
+    // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+    let rsa_pk = RsaPublicKeyAsn1::from_der(pk_bytes).context(RsaParseSnafu)?;
+
+    Ok(PublicJwk::builder()
+        .algorithm(algorithm)
+        .maybe_kid(kid)
+        .key_use(key_use)
+        .key(
+            jwk::RsaPublicKey::builder()
+                .n(rsa_pk.modulus.as_bytes().to_vec())
+                .e(rsa_pk.public_exponent.as_bytes().to_vec()),
+        )
+        .build())
+}
+
+fn parse_ed25519_public_key(
+    pem: &str,
+    algorithm: &str,
+    kid: Option<&str>,
+    key_use: jwk::KeyUse,
+) -> Result<PublicJwk, PublicKeyParseError> {
+    let der_bytes = decode_pem(pem).context(PemDecodeSnafu)?;
+    let spki = spki::SubjectPublicKeyInfoRef::from_der(&der_bytes).context(SpkiParseSnafu)?;
+    let pk_bytes = spki.subject_public_key.raw_bytes();
+
+    ensure!(
+        pk_bytes.len() == 32,
+        Ed25519LengthSnafu {
+            length: pk_bytes.len()
+        }
+    );
+
+    Ok(PublicJwk::builder()
+        .algorithm(algorithm)
+        .maybe_kid(kid)
+        .key_use(key_use)
+        .key(
+            jwk::OkpPublicKey::builder()
+                .crv("Ed25519")
+                .x(pk_bytes.to_vec()),
+        )
+        .build())
+}
+
+/// Decode a PEM string to DER bytes.
+fn decode_pem(pem: &str) -> Result<Vec<u8>, pem_rfc7468::Error> {
+    pem_rfc7468::decode_vec(pem.as_bytes()).map(|(_label, der)| der)
+}
+
+/// ASN.1 structure for an RSA public key.
+#[derive(der::Sequence)]
+struct RsaPublicKeyAsn1<'a> {
+    modulus: der::asn1::UintRef<'a>,
+    public_exponent: der::asn1::UintRef<'a>,
+}
+
+// ─── ECDSA signature conversion ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EcDsaVariant {
+    P256,
+    P384,
+}
+
+/// Converts a DER-encoded ECDSA signature to fixed-size (r || s) format for JWT.
+///
+/// GCP KMS returns ECDSA signatures in DER format (ASN.1 SEQUENCE), but JWT/JWS
+/// requires IEEE P1363 format (raw r||s concatenation).
+fn convert_ecdsa_der_to_fixed(
+    der_sig: &[u8],
+    variant: EcDsaVariant,
+) -> Result<Vec<u8>, signature::Error> {
+    match variant {
+        EcDsaVariant::P256 => {
+            let sig = p256::ecdsa::Signature::from_der(der_sig)?;
+            Ok(sig.to_bytes().to_vec())
+        }
+        EcDsaVariant::P384 => {
+            let sig = p384::ecdsa::Signature::from_der(der_sig)?;
+            Ok(sig.to_bytes().to_vec())
+        }
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    const RSA_2048_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu1SU1LfVLPHCozMxH2Mo\n\
+        4lgOEePzNm0tRgeLezV6ffAt0gunVTLw7onLRnrq0/IzW7yWR7QkrmBL7jTKEn5u\n\
+        +qKhbwKfBstIs+bMY2Zkp18gnTxKLxoS2tFczGkPLPgizskuemMghRniWaoLcyeh\n\
+        kd3qqGElvW/VDL5AaWTg0nLVkjRo9z+40RQzuVaE8AkAFmxZzow3x+VJYKdjykkJ\n\
+        0iT9wCS0DRTXu269V264Vf/3jvredZiKRkgwlL9xNAwxXFg0x/XFw005UWVRIkdg\n\
+        cKWTjpBP2dPwVZ4WWC+9aGVd+Gyn1o0CLelf4rEjGoXbAAEgAqeGUxrcIlbjXfbc\n\
+        mwIDAQAB\n\
+        -----END PUBLIC KEY-----";
+
+    const P256_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEh07Vhy18exUbbDOWC8KFtcUnw1nL\n\
+        hU0zM/L+vXZ2QJRykZKgVHVizTVnAw2jEszcMCY6CiAR2TU2SNhNhASV/g==\n\
+        -----END PUBLIC KEY-----";
+
+    const P384_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE0W/oUiIVHc69FmdLEAnBm6J5xXDBjhBh\n\
+        3YOaHjc6bQ9Rqqiinpvq5s4K3ob4WtZrrHQQNldYsxRCeoW5imtuhz55J8nrXyh1\n\
+        hYo8wqhEAWj4k4lWZQ4F+eFa4dzRkgUP\n\
+        -----END PUBLIC KEY-----";
+
+    const ED25519_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n\
+        -----END PUBLIC KEY-----";
+
+    #[test]
+    fn parse_p256_public_key() {
+        let jwk = parse_public_key_pem(
+            P256_PUBLIC_KEY_PEM,
+            "ES256",
+            Some("test-kid"),
+            jwk::KeyUse::Sign,
+        )
+        .unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some("ES256"));
+        assert_eq!(jwk.kid.as_deref(), Some("test-kid"));
+        assert_eq!(jwk.key_use, Some(jwk::KeyUse::Sign));
+        assert!(jwk.thumbprint().is_some());
+    }
+
+    #[test]
+    fn parse_p384_public_key() {
+        let jwk =
+            parse_public_key_pem(P384_PUBLIC_KEY_PEM, "ES384", None, jwk::KeyUse::Sign).unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some("ES384"));
+        assert!(jwk.kid.is_none());
+        assert!(jwk.thumbprint().is_some());
+    }
+
+    #[test]
+    fn parse_rsa_public_key_rs256() {
+        let jwk = parse_public_key_pem(
+            RSA_2048_PUBLIC_KEY_PEM,
+            "RS256",
+            Some("rsa-kid"),
+            jwk::KeyUse::Sign,
+        )
+        .unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some("RS256"));
+        assert_eq!(jwk.kid.as_deref(), Some("rsa-kid"));
+        assert!(jwk.thumbprint().is_some());
+    }
+
+    #[test]
+    fn parse_rsa_public_key_ps256() {
+        let jwk = parse_public_key_pem(RSA_2048_PUBLIC_KEY_PEM, "PS256", None, jwk::KeyUse::Sign)
+            .unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some("PS256"));
+        assert!(jwk.thumbprint().is_some());
+    }
+
+    #[test]
+    fn parse_ed25519_public_key_success() {
+        let jwk = parse_public_key_pem(
+            ED25519_PUBLIC_KEY_PEM,
+            "Ed25519",
+            Some("ed-kid"),
+            jwk::KeyUse::Sign,
+        )
+        .unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some("Ed25519"));
+        assert_eq!(jwk.kid.as_deref(), Some("ed-kid"));
+        assert!(jwk.thumbprint().is_some());
+    }
+
+    #[test]
+    fn parse_ed25519_public_key_with_eddsa_algorithm() {
+        let jwk = parse_public_key_pem(
+            ED25519_PUBLIC_KEY_PEM,
+            "EdDSA",
+            Some("ed-kid"),
+            jwk::KeyUse::Sign,
+        )
+        .unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some("EdDSA"));
+        assert_eq!(jwk.kid.as_deref(), Some("ed-kid"));
+        assert!(jwk.thumbprint().is_some());
+    }
+
+    #[test]
+    fn parse_wrong_algorithm_for_pem_fails() {
+        // P256 PEM with RS256 algorithm should fail
+        let result = parse_public_key_pem(P256_PUBLIC_KEY_PEM, "RS256", None, jwk::KeyUse::Sign);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_invalid_pem_fails() {
+        let result = parse_public_key_pem("not a PEM", "ES256", None, jwk::KeyUse::Sign);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_unsupported_algorithm_fails() {
+        let result = parse_public_key_pem(P256_PUBLIC_KEY_PEM, "HS256", None, jwk::KeyUse::Sign);
+        assert!(matches!(
+            result.unwrap_err(),
+            PublicKeyParseError::UnsupportedParseAlgorithm { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_p256_without_kid() {
+        let jwk =
+            parse_public_key_pem(P256_PUBLIC_KEY_PEM, "ES256", None, jwk::KeyUse::Sign).unwrap();
+        assert!(jwk.kid.is_none());
+    }
+
+    #[test]
+    fn parse_rsa_and_ec_produce_different_thumbprints() {
+        let rsa_jwk =
+            parse_public_key_pem(RSA_2048_PUBLIC_KEY_PEM, "RS256", None, jwk::KeyUse::Sign)
+                .unwrap();
+        let ec_jwk =
+            parse_public_key_pem(P256_PUBLIC_KEY_PEM, "ES256", None, jwk::KeyUse::Sign).unwrap();
+        assert_ne!(rsa_jwk.thumbprint(), ec_jwk.thumbprint());
+    }
+
+    #[test]
+    fn parse_rsa_public_key_with_encrypt_use() {
+        let jwk = parse_public_key_pem(
+            RSA_2048_PUBLIC_KEY_PEM,
+            "RSA-OAEP-256",
+            Some("enc-kid"),
+            jwk::KeyUse::Encrypt,
+        )
+        .unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some("RSA-OAEP-256"));
+        assert_eq!(jwk.kid.as_deref(), Some("enc-kid"));
+        assert_eq!(jwk.key_use, Some(jwk::KeyUse::Encrypt));
+        assert!(jwk.thumbprint().is_some());
+    }
+
+    #[test]
+    fn get_jwe_algorithm_rsa_oaep_sha1() {
+        use CryptoKeyVersionAlgorithm::*;
+        assert_eq!(get_jwe_algorithm(&RsaDecryptOaep2048Sha1), Some("RSA-OAEP"));
+        assert_eq!(get_jwe_algorithm(&RsaDecryptOaep3072Sha1), Some("RSA-OAEP"));
+        assert_eq!(get_jwe_algorithm(&RsaDecryptOaep4096Sha1), Some("RSA-OAEP"));
+    }
+
+    #[test]
+    fn get_jwe_algorithm_rsa_oaep_sha256() {
+        use CryptoKeyVersionAlgorithm::*;
+        assert_eq!(
+            get_jwe_algorithm(&RsaDecryptOaep2048Sha256),
+            Some("RSA-OAEP-256")
+        );
+        assert_eq!(
+            get_jwe_algorithm(&RsaDecryptOaep3072Sha256),
+            Some("RSA-OAEP-256")
+        );
+        assert_eq!(
+            get_jwe_algorithm(&RsaDecryptOaep4096Sha256),
+            Some("RSA-OAEP-256")
+        );
+    }
+
+    #[test]
+    fn get_jwe_algorithm_rsa_oaep_sha512() {
+        use CryptoKeyVersionAlgorithm::*;
+        assert_eq!(
+            get_jwe_algorithm(&RsaDecryptOaep4096Sha512),
+            Some("RSA-OAEP-512")
+        );
+    }
+
+    #[test]
+    fn get_jwe_algorithm_signing_key_returns_none() {
+        use CryptoKeyVersionAlgorithm::*;
+        assert_eq!(get_jwe_algorithm(&EcSignP256Sha256), None);
+        assert_eq!(get_jwe_algorithm(&RsaSignPss2048Sha256), None);
+    }
+}
