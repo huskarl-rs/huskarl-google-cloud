@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "huskarl-google-cloud"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bon",
  "der",
