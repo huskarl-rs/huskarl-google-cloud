@@ -47,6 +47,15 @@ pub enum SetupError {
         /// The underlying parse error.
         source: PublicKeyParseError,
     },
+    /// Failed to list crypto key versions.
+    ListCryptoKeyVersions {
+        /// The underlying error from the KMS API.
+        source: google_cloud_kms_v1::Error,
+    },
+    /// No enabled crypto key versions found.
+    NoEnabledCryptoKeyVersions,
+    /// The resolved primary version was not found among the enabled versions.
+    PrimaryVersionNotFound,
 }
 
 /// Errors that can occur when parsing a public key PEM into a JWK.
@@ -261,16 +270,7 @@ impl JwsSigner for KeyVersion {
 }
 
 impl AsymmetricJwsSignerSelector for KeyVersion {
-    type AsymmetricSigner = Self;
-
-    fn select_asymmetric_signer(&self) -> Self::AsymmetricSigner {
-        self.clone()
-    }
-
-    fn select_asymmetric_signer_by_thumbprint(
-        &self,
-        thumbprint: &str,
-    ) -> Option<Self::AsymmetricSigner> {
+    fn select_signer_by_thumbprint(&self, thumbprint: &str) -> Option<Self> {
         if self.thumbprint == thumbprint {
             Some(self.clone())
         } else {
@@ -289,8 +289,11 @@ impl AsymmetricJwsSigner for KeyVersion {
 
 /// A signing key backed by a Cloud KMS `CryptoKey`.
 ///
-/// Resolves a key version using the configured [`VersionStrategy`],
-/// then delegates signing to the resolved [`KeyVersion`].
+/// Resolves a primary key version using the configured [`VersionStrategy`]
+/// and loads all enabled signing-capable versions. The primary version is
+/// used for signing via [`JwsSignerSelector::select_signer`], while all
+/// enabled versions are available for thumbprint-based selection via
+/// [`AsymmetricJwsSignerSelector::select_signer_by_thumbprint`].
 ///
 /// # Examples
 ///
@@ -330,17 +333,25 @@ impl AsymmetricJwsSigner for KeyVersion {
 /// ```
 #[derive(Debug, Clone)]
 pub struct SigningKey {
-    cached_version: KeyVersion,
+    primary: KeyVersion,
+    additional: Vec<KeyVersion>,
 }
 
 #[bon]
 impl SigningKey {
     /// Create a new `SigningKey` from a Cloud KMS crypto key resource name.
     ///
+    /// Resolves the primary version using the configured strategy and loads
+    /// all enabled signing-capable versions. The primary is used for
+    /// [`select_signer`](JwsSignerSelector::select_signer), while all
+    /// versions are searchable by thumbprint via
+    /// [`select_signer_by_thumbprint`](AsymmetricJwsSignerSelector::select_signer_by_thumbprint).
+    ///
     /// # Errors
     ///
     /// Returns an error if the version could not be resolved, the public key
-    /// could not be retrieved, or the algorithm is not supported.
+    /// could not be retrieved, the algorithm is not supported, or the primary
+    /// version is not among the enabled versions.
     #[builder(finish_fn = build)]
     pub async fn builder(
         /// The full resource name of the crypto key.
@@ -365,21 +376,106 @@ impl SigningKey {
         /// Derive a kid value from the key version ID.
         #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
         with_kid_from_key_version: Option<KidMapper>,
+        /// Maximum number of enabled versions to load.
+        ///
+        /// When set, at most this many versions are fetched (newest-first).
+        /// The API `page_size` is set to this value, so a single API call
+        /// suffices when the number of enabled versions is within the limit.
+        ///
+        /// When unset, all enabled versions are fetched (may require multiple
+        /// paged requests).
+        max_versions: Option<usize>,
     ) -> Result<Self, SetupError> {
-        let version_id = super::super::version::resolve_version(&key_name, &strategy, &kms_client)
-            .await
-            .context(VersionResolutionSnafu)?;
-        let version_resource_name = format!("{key_name}/cryptoKeyVersions/{version_id}");
+        // Resolve the primary version and list all enabled versions concurrently.
+        let (primary_version_id, all_versions) = futures_util::try_join!(
+            async {
+                super::super::version::resolve_version(&key_name, &strategy, &kms_client)
+                    .await
+                    .context(VersionResolutionSnafu)
+            },
+            async {
+                super::super::version::list_enabled_kms_versions(
+                    &kms_client,
+                    &key_name,
+                    max_versions,
+                    Some("name desc"),
+                )
+                .await
+                .context(ListCryptoKeyVersionsSnafu)
+            },
+        )?;
 
-        let cached_version = build_key_version(
-            version_resource_name,
-            kms_client,
-            use_fully_specified_jws_algorithm,
-            with_kid_from_key_version,
-        )
-        .await?;
+        ensure!(!all_versions.is_empty(), NoEnabledCryptoKeyVersionsSnafu);
 
-        Ok(Self { cached_version })
+        let primary_resource_name = format!("{key_name}/cryptoKeyVersions/{primary_version_id}");
+        let kms_ref = &kms_client;
+        let kid_mapper = with_kid_from_key_version.as_ref();
+
+        // Fetch public keys for all enabled signing-capable versions concurrently.
+        let futures: Vec<_> = all_versions
+            .iter()
+            .filter_map(|version| {
+                let alg = get_jws_algorithm(&version.algorithm)?;
+                let version_id =
+                    super::super::version::version_id_from_resource_name(&version.name);
+                let kid = kid_mapper.map(|f| f(version_id));
+                let name = &version.name;
+
+                Some(async move {
+                    let pk_response = kms_ref
+                        .get_public_key()
+                        .set_name(name)
+                        .send()
+                        .await
+                        .context(GetPublicKeySnafu)?;
+
+                    let jws_algorithm = if !use_fully_specified_jws_algorithm && alg == "Ed25519" {
+                        "EdDSA"
+                    } else {
+                        alg
+                    };
+
+                    let public_key_jwk = parse_public_key_pem(
+                        &pk_response.pem,
+                        jws_algorithm,
+                        kid.as_deref(),
+                        jwk::KeyUse::Sign,
+                    )
+                    .context(PublicKeyParseSnafu)?;
+
+                    let thumbprint = public_key_jwk.thumbprint();
+
+                    Ok::<_, SetupError>(KeyVersion {
+                        kms_client: kms_ref.clone(),
+                        resource_name: name.clone(),
+                        jws_algorithm: jws_algorithm.to_string(),
+                        key_id: kid,
+                        public_key_jwk,
+                        thumbprint,
+                    })
+                })
+            })
+            .collect();
+
+        let all_key_versions = futures_util::future::try_join_all(futures).await?;
+
+        // Separate primary from additional versions.
+        let mut primary = None;
+        let mut additional = Vec::with_capacity(all_key_versions.len().saturating_sub(1));
+        for kv in all_key_versions {
+            if kv.resource_name == primary_resource_name {
+                primary = Some(kv);
+            } else {
+                additional.push(kv);
+            }
+        }
+
+        let primary = primary.context(PrimaryVersionNotFoundSnafu)?;
+
+        Ok(Self {
+            primary,
+            additional,
+        })
     }
 }
 
@@ -387,20 +483,19 @@ impl JwsSignerSelector for SigningKey {
     type Signer = KeyVersion;
 
     fn select_signer(&self) -> KeyVersion {
-        self.cached_version.clone()
+        self.primary.clone()
     }
 }
 
 impl AsymmetricJwsSignerSelector for SigningKey {
-    type AsymmetricSigner = KeyVersion;
-
-    fn select_asymmetric_signer(&self) -> KeyVersion {
-        self.cached_version.clone()
-    }
-
-    fn select_asymmetric_signer_by_thumbprint(&self, thumbprint: &str) -> Option<KeyVersion> {
-        self.cached_version
-            .select_asymmetric_signer_by_thumbprint(thumbprint)
+    fn select_signer_by_thumbprint(&self, thumbprint: &str) -> Option<KeyVersion> {
+        if self.primary.thumbprint == thumbprint {
+            return Some(self.primary.clone());
+        }
+        self.additional
+            .iter()
+            .find(|kv| kv.thumbprint == thumbprint)
+            .cloned()
     }
 }
 
@@ -412,9 +507,6 @@ async fn build_key_version(
     use_fully_specified_jws_algorithm: bool,
     with_kid_from_key_version: Option<KidMapper>,
 ) -> Result<KeyVersion, SetupError> {
-    let version_id = super::super::version::version_id_from_resource_name(&resource_name);
-    let key_id = with_kid_from_key_version.map(|f| f(version_id));
-
     // Fetch the public key — this also gives us the algorithm.
     let public_key_response = kms_client
         .get_public_key()
@@ -422,6 +514,17 @@ async fn build_key_version(
         .send()
         .await
         .context(GetPublicKeySnafu)?;
+
+    // Use the canonical name from the response to resolve aliases.
+    // If the input was an alias (e.g. ".../cryptoKeyVersions/primary"),
+    // the response name will be the real version (e.g. ".../cryptoKeyVersions/3").
+    let resolved_name = if public_key_response.name.is_empty() {
+        resource_name
+    } else {
+        public_key_response.name.clone()
+    };
+    let version_id = super::super::version::version_id_from_resource_name(&resolved_name);
+    let key_id = with_kid_from_key_version.map(|f| f(version_id));
 
     let jws_algorithm = get_jws_algorithm(&public_key_response.algorithm).with_context(|| {
         UnsupportedAlgorithmSnafu {
@@ -445,14 +548,11 @@ async fn build_key_version(
     )
     .context(PublicKeyParseSnafu)?;
 
-    let thumbprint = public_key_jwk
-        .thumbprint()
-        .ok_or(PublicKeyParseError::Thumbprint)
-        .context(PublicKeyParseSnafu)?;
+    let thumbprint = public_key_jwk.thumbprint();
 
     Ok(KeyVersion {
         kms_client,
-        resource_name,
+        resource_name: resolved_name,
         jws_algorithm: jws_algorithm.to_string(),
         key_id,
         public_key_jwk,
@@ -715,7 +815,6 @@ mod tests {
         assert_eq!(jwk.algorithm.as_deref(), Some("ES256"));
         assert_eq!(jwk.kid.as_deref(), Some("test-kid"));
         assert_eq!(jwk.key_use, Some(jwk::KeyUse::Sign));
-        assert!(jwk.thumbprint().is_some());
     }
 
     #[test]
@@ -724,7 +823,6 @@ mod tests {
             parse_public_key_pem(P384_PUBLIC_KEY_PEM, "ES384", None, jwk::KeyUse::Sign).unwrap();
         assert_eq!(jwk.algorithm.as_deref(), Some("ES384"));
         assert!(jwk.kid.is_none());
-        assert!(jwk.thumbprint().is_some());
     }
 
     #[test]
@@ -738,7 +836,6 @@ mod tests {
         .unwrap();
         assert_eq!(jwk.algorithm.as_deref(), Some("RS256"));
         assert_eq!(jwk.kid.as_deref(), Some("rsa-kid"));
-        assert!(jwk.thumbprint().is_some());
     }
 
     #[test]
@@ -746,7 +843,6 @@ mod tests {
         let jwk = parse_public_key_pem(RSA_2048_PUBLIC_KEY_PEM, "PS256", None, jwk::KeyUse::Sign)
             .unwrap();
         assert_eq!(jwk.algorithm.as_deref(), Some("PS256"));
-        assert!(jwk.thumbprint().is_some());
     }
 
     #[test]
@@ -760,7 +856,6 @@ mod tests {
         .unwrap();
         assert_eq!(jwk.algorithm.as_deref(), Some("Ed25519"));
         assert_eq!(jwk.kid.as_deref(), Some("ed-kid"));
-        assert!(jwk.thumbprint().is_some());
     }
 
     #[test]
@@ -774,7 +869,6 @@ mod tests {
         .unwrap();
         assert_eq!(jwk.algorithm.as_deref(), Some("EdDSA"));
         assert_eq!(jwk.kid.as_deref(), Some("ed-kid"));
-        assert!(jwk.thumbprint().is_some());
     }
 
     #[test]
@@ -828,7 +922,6 @@ mod tests {
         assert_eq!(jwk.algorithm.as_deref(), Some("RSA-OAEP-256"));
         assert_eq!(jwk.kid.as_deref(), Some("enc-kid"));
         assert_eq!(jwk.key_use, Some(jwk::KeyUse::Encrypt));
-        assert!(jwk.thumbprint().is_some());
     }
 
     #[test]

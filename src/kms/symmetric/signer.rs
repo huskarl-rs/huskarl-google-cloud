@@ -261,19 +261,26 @@ impl SigningKey {
             .context(ResolveVersionSnafu)?;
 
         let resource_name = format!("{key_name}/cryptoKeyVersions/{version_id}");
-        let vid = version::version_id_from_resource_name(&resource_name);
-        let key_id = with_kid_from_key_version.as_ref().map(|f| f(vid));
 
-        let kv_meta = kms_client
+        let kv_response = kms_client
             .get_crypto_key_version()
             .set_name(&resource_name)
             .send()
             .await
             .context(GetCryptoKeyVersionSnafu)?;
 
-        let jws_algorithm = get_jws_algorithm(&kv_meta.algorithm).ok_or_else(|| {
+        // Use the canonical name from the response to resolve aliases.
+        let resolved_name = if kv_response.name.is_empty() {
+            resource_name
+        } else {
+            kv_response.name
+        };
+        let vid = version::version_id_from_resource_name(&resolved_name);
+        let key_id = with_kid_from_key_version.as_ref().map(|f| f(vid));
+
+        let jws_algorithm = get_jws_algorithm(&kv_response.algorithm).ok_or_else(|| {
             UnsupportedAlgorithmSnafu {
-                algorithm: kv_meta.algorithm,
+                algorithm: kv_response.algorithm,
             }
             .build()
         })?;
@@ -281,7 +288,7 @@ impl SigningKey {
         Ok(Self {
             key_version: KeyVersion {
                 kms_client,
-                resource_name,
+                resource_name: resolved_name,
                 jws_algorithm: jws_algorithm.to_string(),
                 key_id,
             },
@@ -429,24 +436,30 @@ async fn build_key_version(
     kms_client: KeyManagementService,
     with_kid_from_key_version: Option<KidMapper>,
 ) -> Result<KeyVersion, SetupError> {
-    let version_id = version::version_id_from_resource_name(&resource_name);
-    let key_id = with_kid_from_key_version.map(|f| f(version_id));
-
-    let key_version = kms_client
+    let kv_response = kms_client
         .get_crypto_key_version()
         .set_name(&resource_name)
         .send()
         .await
         .context(setup::GetCryptoKeyVersionSnafu)?;
 
+    // Use the canonical name from the response to resolve aliases.
+    let resolved_name = if kv_response.name.is_empty() {
+        resource_name
+    } else {
+        kv_response.name
+    };
+    let version_id = version::version_id_from_resource_name(&resolved_name);
+    let key_id = with_kid_from_key_version.map(|f| f(version_id));
+
     let jws_algorithm =
-        get_jws_algorithm(&key_version.algorithm).context(setup::UnsupportedAlgorithmSnafu {
-            algorithm: key_version.algorithm,
+        get_jws_algorithm(&kv_response.algorithm).context(setup::UnsupportedAlgorithmSnafu {
+            algorithm: kv_response.algorithm,
         })?;
 
     Ok(KeyVersion {
         kms_client,
-        resource_name,
+        resource_name: resolved_name,
         jws_algorithm: jws_algorithm.to_string(),
         key_id,
     })

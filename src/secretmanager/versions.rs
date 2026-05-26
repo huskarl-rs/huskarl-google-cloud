@@ -211,19 +211,20 @@ impl<D: SecretDecoder> SecretVersions<D> {
         let primary_alias_resource =
             format!("{}/versions/{}", self.secret_name, self.primary_alias);
 
-        // Resolve the alias to a concrete version name.
-        let primary_meta = self
-            .client
-            .get_secret_version()
-            .set_name(&primary_alias_resource)
-            .send()
-            .await
-            .context(GetSecretVersionSnafu)?;
+        // Resolve the alias and list all enabled versions concurrently.
+        let (primary_meta, raw) = futures_util::try_join!(
+            async {
+                self.client
+                    .get_secret_version()
+                    .set_name(&primary_alias_resource)
+                    .send()
+                    .await
+                    .context(GetSecretVersionSnafu)
+            },
+            self.list_enabled_versions(),
+        )?;
 
         let primary_name = primary_meta.name;
-
-        // List all enabled versions.
-        let raw = self.list_enabled_versions().await?;
         ensure!(!raw.is_empty(), NoEnabledSecretVersionsSnafu);
 
         // Build handles, tracking the primary by matching its resolved name.

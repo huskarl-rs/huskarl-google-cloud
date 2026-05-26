@@ -876,9 +876,9 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "huskarl-core"
-version = "0.5.1"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d34a5d1aa7247d61a833ecf92edba0f65e461189e5825888007f6b39a8b21fa"
+checksum = "be80cf5e17ec77b7f412528ddfc4bfaab01d0f29c26c5a79b27119940114e8dd"
 dependencies = [
  "arc-swap",
  "base64",
@@ -898,11 +898,12 @@ dependencies = [
  "snafu",
  "tokio",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]
 name = "huskarl-google-cloud"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bon",
  "der",

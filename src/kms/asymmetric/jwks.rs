@@ -142,7 +142,7 @@ impl Jwks {
 
         let keys = futures_util::future::try_join_all(futures).await?;
 
-        Ok(PublicJwks { keys })
+        Ok(PublicJwks::new(keys))
     }
 
     async fn list_enabled_versions(
