@@ -12,6 +12,7 @@ use huskarl_core::crypto::signer::{
     AsymmetricJwsSigner, AsymmetricJwsSignerSelector, JwsSigner, JwsSignerSelector,
 };
 use huskarl_core::jwk::{self, PublicJwk};
+use huskarl_core::platform::MaybeSendBoxFuture;
 use p256::ecdsa::signature;
 use p256::elliptic_curve::pkcs8::DecodePublicKey as _;
 use p256::elliptic_curve::sec1::ToSec1Point as _;
@@ -128,12 +129,25 @@ pub enum SigningError {
     MismatchedKeyInfo,
 }
 
-impl huskarl_core::Error for SigningError {
-    fn is_retryable(&self) -> bool {
+impl SigningError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             SigningError::AsymmetricSign { source } => source.is_timeout() || source.is_exhausted(),
             SigningError::SignatureConversion { .. } | SigningError::MismatchedKeyInfo => false,
         }
+    }
+}
+
+impl From<SigningError> for huskarl_core::Error {
+    fn from(err: SigningError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
     }
 }
 
@@ -224,16 +238,12 @@ impl KeyVersion {
 }
 
 impl JwsSignerSelector for KeyVersion {
-    type Signer = Self;
-
-    fn select_signer(&self) -> Self::Signer {
-        self.clone()
+    fn select_signer(&self) -> Arc<dyn JwsSigner> {
+        Arc::new(self.clone())
     }
 }
 
 impl JwsSigner for KeyVersion {
-    type Error = SigningError;
-
     fn jws_algorithm(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.jws_algorithm)
     }
@@ -242,37 +252,53 @@ impl JwsSigner for KeyVersion {
         self.key_id.as_deref().map(Cow::Borrowed)
     }
 
-    async fn sign(&self, input: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        let response = self
-            .kms_client
-            .asymmetric_sign()
-            .set_name(&self.resource_name)
-            .set_data(input.to_vec())
-            .send()
-            .await
-            .context(AsymmetricSignSnafu)?;
+    fn sign<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, huskarl_core::Error>> {
+        Box::pin(async move {
+            let response = self
+                .kms_client
+                .asymmetric_sign()
+                .set_name(&self.resource_name)
+                .set_data(input.to_vec())
+                .send()
+                .await
+                .context(AsymmetricSignSnafu)?;
 
-        // Verify the response came from the expected key version.
-        ensure!(response.name == self.resource_name, MismatchedKeyInfoSnafu);
+            // Verify the response came from the expected key version.
+            if response.name != self.resource_name {
+                return Err(SigningError::MismatchedKeyInfo.into());
+            }
 
-        let signature = response.signature.to_vec();
+            let signature = response.signature.to_vec();
 
-        // For ECDSA, KMS returns DER-encoded signatures but JWT needs
-        // fixed-size IEEE P1363 format (r || s).
-        match self.jws_algorithm.as_str() {
-            "ES256" => convert_ecdsa_der_to_fixed(&signature, EcDsaVariant::P256)
-                .context(SignatureConversionSnafu),
-            "ES384" => convert_ecdsa_der_to_fixed(&signature, EcDsaVariant::P384)
-                .context(SignatureConversionSnafu),
-            _ => Ok(signature),
-        }
+            // For ECDSA, KMS returns DER-encoded signatures but JWT needs
+            // fixed-size IEEE P1363 format (r || s).
+            let signature = match self.jws_algorithm.as_str() {
+                "ES256" => convert_ecdsa_der_to_fixed(&signature, EcDsaVariant::P256)
+                    .context(SignatureConversionSnafu)?,
+                "ES384" => convert_ecdsa_der_to_fixed(&signature, EcDsaVariant::P384)
+                    .context(SignatureConversionSnafu)?,
+                _ => signature,
+            };
+
+            Ok(signature)
+        })
     }
 }
 
 impl AsymmetricJwsSignerSelector for KeyVersion {
-    fn select_signer_by_thumbprint(&self, thumbprint: &str) -> Option<Self> {
+    fn select_asymmetric_signer(&self) -> Arc<dyn AsymmetricJwsSigner> {
+        Arc::new(self.clone())
+    }
+
+    fn select_signer_by_thumbprint(
+        &self,
+        thumbprint: &str,
+    ) -> Option<Arc<dyn AsymmetricJwsSigner>> {
         if self.thumbprint == thumbprint {
-            Some(self.clone())
+            Some(Arc::new(self.clone()))
         } else {
             None
         }
@@ -480,22 +506,27 @@ impl SigningKey {
 }
 
 impl JwsSignerSelector for SigningKey {
-    type Signer = KeyVersion;
-
-    fn select_signer(&self) -> KeyVersion {
-        self.primary.clone()
+    fn select_signer(&self) -> Arc<dyn JwsSigner> {
+        Arc::new(self.primary.clone())
     }
 }
 
 impl AsymmetricJwsSignerSelector for SigningKey {
-    fn select_signer_by_thumbprint(&self, thumbprint: &str) -> Option<KeyVersion> {
+    fn select_asymmetric_signer(&self) -> Arc<dyn AsymmetricJwsSigner> {
+        Arc::new(self.primary.clone())
+    }
+
+    fn select_signer_by_thumbprint(
+        &self,
+        thumbprint: &str,
+    ) -> Option<Arc<dyn AsymmetricJwsSigner>> {
         if self.primary.thumbprint == thumbprint {
-            return Some(self.primary.clone());
+            return Some(Arc::new(self.primary.clone()));
         }
         self.additional
             .iter()
             .find(|kv| kv.thumbprint == thumbprint)
-            .cloned()
+            .map(|kv| Arc::new(kv.clone()) as Arc<dyn AsymmetricJwsSigner>)
     }
 }
 
@@ -803,85 +834,79 @@ mod tests {
         MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=\n\
         -----END PUBLIC KEY-----";
 
-    #[test]
-    fn parse_p256_public_key() {
-        let jwk = parse_public_key_pem(
-            P256_PUBLIC_KEY_PEM,
-            "ES256",
-            Some("test-kid"),
-            jwk::KeyUse::Sign,
-        )
-        .unwrap();
-        assert_eq!(jwk.algorithm.as_deref(), Some("ES256"));
-        assert_eq!(jwk.kid.as_deref(), Some("test-kid"));
-        assert_eq!(jwk.key_use, Some(jwk::KeyUse::Sign));
+    use std::future::Future;
+
+    use google_cloud_gax::Result as GaxResult;
+    use google_cloud_gax::options::RequestOptions;
+    use google_cloud_gax::response::Response;
+    use google_cloud_kms_v1::model::{AsymmetricSignRequest, AsymmetricSignResponse};
+    use google_cloud_kms_v1::stub::KeyManagementService as KmsStub;
+    use huskarl_core::ErrorKind;
+    use rstest::rstest;
+
+    const RESOURCE: &str = "projects/p/.../cryptoKeyVersions/1";
+
+    #[derive(Debug, Clone, Default)]
+    struct MockKms {
+        response_name: String,
+        signature: Vec<u8>,
     }
 
-    #[test]
-    fn parse_p384_public_key() {
-        let jwk =
-            parse_public_key_pem(P384_PUBLIC_KEY_PEM, "ES384", None, jwk::KeyUse::Sign).unwrap();
-        assert_eq!(jwk.algorithm.as_deref(), Some("ES384"));
-        assert!(jwk.kid.is_none());
+    impl KmsStub for MockKms {
+        fn asymmetric_sign(
+            &self,
+            _req: AsymmetricSignRequest,
+            _options: RequestOptions,
+        ) -> impl Future<Output = GaxResult<Response<AsymmetricSignResponse>>> + Send {
+            let resp = AsymmetricSignResponse::default()
+                .set_name(self.response_name.clone())
+                .set_signature(self.signature.clone());
+            async move { Ok(Response::from(resp)) }
+        }
     }
 
-    #[test]
-    fn parse_rsa_public_key_rs256() {
-        let jwk = parse_public_key_pem(
-            RSA_2048_PUBLIC_KEY_PEM,
-            "RS256",
-            Some("rsa-kid"),
-            jwk::KeyUse::Sign,
-        )
-        .unwrap();
-        assert_eq!(jwk.algorithm.as_deref(), Some("RS256"));
-        assert_eq!(jwk.kid.as_deref(), Some("rsa-kid"));
+    /// Build a signing `KeyVersion` backed by the stub. The public key is real
+    /// (parsed from a constant) so the struct is well-formed; signing behaviour
+    /// is driven entirely by the stub and `jws_algorithm`.
+    fn signing_key_version(mock: MockKms, jws_algorithm: &str) -> KeyVersion {
+        let public_key_jwk =
+            parse_public_key_pem(P256_PUBLIC_KEY_PEM, "ES256", None, jwk::KeyUse::Sign).unwrap();
+        let thumbprint = public_key_jwk.thumbprint();
+        KeyVersion {
+            kms_client: KeyManagementService::from_stub(mock),
+            resource_name: RESOURCE.to_owned(),
+            jws_algorithm: jws_algorithm.to_owned(),
+            key_id: None,
+            public_key_jwk,
+            thumbprint,
+        }
     }
 
-    #[test]
-    fn parse_rsa_public_key_ps256() {
-        let jwk = parse_public_key_pem(RSA_2048_PUBLIC_KEY_PEM, "PS256", None, jwk::KeyUse::Sign)
-            .unwrap();
-        assert_eq!(jwk.algorithm.as_deref(), Some("PS256"));
+    #[rstest]
+    #[case(P256_PUBLIC_KEY_PEM, "ES256", Some("test-kid"), jwk::KeyUse::Sign)]
+    #[case(P384_PUBLIC_KEY_PEM, "ES384", None, jwk::KeyUse::Sign)]
+    #[case(RSA_2048_PUBLIC_KEY_PEM, "RS256", Some("rsa-kid"), jwk::KeyUse::Sign)]
+    #[case(RSA_2048_PUBLIC_KEY_PEM, "PS256", None, jwk::KeyUse::Sign)]
+    #[case(ED25519_PUBLIC_KEY_PEM, "Ed25519", Some("ed-kid"), jwk::KeyUse::Sign)]
+    #[case(ED25519_PUBLIC_KEY_PEM, "EdDSA", Some("ed-kid"), jwk::KeyUse::Sign)]
+    #[case(RSA_2048_PUBLIC_KEY_PEM, "RSA-OAEP-256", Some("enc-kid"), jwk::KeyUse::Encrypt)]
+    fn parse_public_key_pem_succeeds(
+        #[case] pem: &str,
+        #[case] algorithm: &str,
+        #[case] kid: Option<&str>,
+        #[case] key_use: jwk::KeyUse,
+    ) {
+        let jwk = parse_public_key_pem(pem, algorithm, kid, key_use).unwrap();
+        assert_eq!(jwk.algorithm.as_deref(), Some(algorithm));
+        assert_eq!(jwk.kid.as_deref(), kid);
+        assert_eq!(jwk.key_use, Some(key_use));
     }
 
-    #[test]
-    fn parse_ed25519_public_key_success() {
-        let jwk = parse_public_key_pem(
-            ED25519_PUBLIC_KEY_PEM,
-            "Ed25519",
-            Some("ed-kid"),
-            jwk::KeyUse::Sign,
-        )
-        .unwrap();
-        assert_eq!(jwk.algorithm.as_deref(), Some("Ed25519"));
-        assert_eq!(jwk.kid.as_deref(), Some("ed-kid"));
-    }
-
-    #[test]
-    fn parse_ed25519_public_key_with_eddsa_algorithm() {
-        let jwk = parse_public_key_pem(
-            ED25519_PUBLIC_KEY_PEM,
-            "EdDSA",
-            Some("ed-kid"),
-            jwk::KeyUse::Sign,
-        )
-        .unwrap();
-        assert_eq!(jwk.algorithm.as_deref(), Some("EdDSA"));
-        assert_eq!(jwk.kid.as_deref(), Some("ed-kid"));
-    }
-
-    #[test]
-    fn parse_wrong_algorithm_for_pem_fails() {
-        // P256 PEM with RS256 algorithm should fail
-        let result = parse_public_key_pem(P256_PUBLIC_KEY_PEM, "RS256", None, jwk::KeyUse::Sign);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_invalid_pem_fails() {
-        let result = parse_public_key_pem("not a PEM", "ES256", None, jwk::KeyUse::Sign);
-        assert!(result.is_err());
+    #[rstest]
+    #[case(P256_PUBLIC_KEY_PEM, "RS256")] // RSA algorithm against an EC PEM
+    #[case("not a PEM", "ES256")]
+    fn parse_public_key_pem_rejects_bad_input(#[case] pem: &str, #[case] algorithm: &str) {
+        assert!(parse_public_key_pem(pem, algorithm, None, jwk::KeyUse::Sign).is_err());
     }
 
     #[test]
@@ -894,13 +919,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_p256_without_kid() {
-        let jwk =
-            parse_public_key_pem(P256_PUBLIC_KEY_PEM, "ES256", None, jwk::KeyUse::Sign).unwrap();
-        assert!(jwk.kid.is_none());
-    }
-
-    #[test]
     fn parse_rsa_and_ec_produce_different_thumbprints() {
         let rsa_jwk =
             parse_public_key_pem(RSA_2048_PUBLIC_KEY_PEM, "RS256", None, jwk::KeyUse::Sign)
@@ -910,58 +928,112 @@ mod tests {
         assert_ne!(rsa_jwk.thumbprint(), ec_jwk.thumbprint());
     }
 
-    #[test]
-    fn parse_rsa_public_key_with_encrypt_use() {
-        let jwk = parse_public_key_pem(
-            RSA_2048_PUBLIC_KEY_PEM,
-            "RSA-OAEP-256",
-            Some("enc-kid"),
-            jwk::KeyUse::Encrypt,
-        )
-        .unwrap();
-        assert_eq!(jwk.algorithm.as_deref(), Some("RSA-OAEP-256"));
-        assert_eq!(jwk.kid.as_deref(), Some("enc-kid"));
-        assert_eq!(jwk.key_use, Some(jwk::KeyUse::Encrypt));
+    #[rstest]
+    #[case(CryptoKeyVersionAlgorithm::RsaSignPss2048Sha256, Some("PS256"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaSignPss4096Sha512, Some("PS512"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaSignPkcs12048Sha256, Some("RS256"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaSignPkcs14096Sha512, Some("RS512"))]
+    #[case(CryptoKeyVersionAlgorithm::EcSignP256Sha256, Some("ES256"))]
+    #[case(CryptoKeyVersionAlgorithm::EcSignP384Sha384, Some("ES384"))]
+    #[case(CryptoKeyVersionAlgorithm::EcSignEd25519, Some("Ed25519"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep2048Sha256, None)] // not a signing alg
+    fn get_jws_algorithm_maps_signing_algorithms(
+        #[case] algorithm: CryptoKeyVersionAlgorithm,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(get_jws_algorithm(&algorithm), expected);
+    }
+
+    #[rstest]
+    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep2048Sha1, Some("RSA-OAEP"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha1, Some("RSA-OAEP"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep2048Sha256, Some("RSA-OAEP-256"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha256, Some("RSA-OAEP-256"))]
+    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha512, Some("RSA-OAEP-512"))]
+    #[case(CryptoKeyVersionAlgorithm::EcSignP256Sha256, None)] // signing key, not JWE
+    #[case(CryptoKeyVersionAlgorithm::RsaSignPss2048Sha256, None)]
+    fn get_jwe_algorithm_maps_encryption_algorithms(
+        #[case] algorithm: CryptoKeyVersionAlgorithm,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(get_jwe_algorithm(&algorithm), expected);
     }
 
     #[test]
-    fn get_jwe_algorithm_rsa_oaep_sha1() {
-        use CryptoKeyVersionAlgorithm::*;
-        assert_eq!(get_jwe_algorithm(&RsaDecryptOaep2048Sha1), Some("RSA-OAEP"));
-        assert_eq!(get_jwe_algorithm(&RsaDecryptOaep3072Sha1), Some("RSA-OAEP"));
-        assert_eq!(get_jwe_algorithm(&RsaDecryptOaep4096Sha1), Some("RSA-OAEP"));
+    fn convert_ecdsa_der_to_fixed_p256_roundtrips() {
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+
+        let sk = SigningKey::from_slice(&[1u8; 32]).unwrap();
+        let sig: Signature = sk.sign(b"message");
+        let fixed = convert_ecdsa_der_to_fixed(sig.to_der().as_bytes(), EcDsaVariant::P256).unwrap();
+
+        assert_eq!(fixed.len(), 64); // r || s, 32 bytes each
+        assert_eq!(fixed, sig.to_bytes().to_vec());
     }
 
     #[test]
-    fn get_jwe_algorithm_rsa_oaep_sha256() {
-        use CryptoKeyVersionAlgorithm::*;
-        assert_eq!(
-            get_jwe_algorithm(&RsaDecryptOaep2048Sha256),
-            Some("RSA-OAEP-256")
-        );
-        assert_eq!(
-            get_jwe_algorithm(&RsaDecryptOaep3072Sha256),
-            Some("RSA-OAEP-256")
-        );
-        assert_eq!(
-            get_jwe_algorithm(&RsaDecryptOaep4096Sha256),
-            Some("RSA-OAEP-256")
-        );
+    fn convert_ecdsa_der_to_fixed_p384_roundtrips() {
+        use p384::ecdsa::{Signature, SigningKey, signature::Signer};
+
+        let sk = SigningKey::from_slice(&[1u8; 48]).unwrap();
+        let sig: Signature = sk.sign(b"message");
+        let fixed = convert_ecdsa_der_to_fixed(sig.to_der().as_bytes(), EcDsaVariant::P384).unwrap();
+
+        assert_eq!(fixed.len(), 96); // r || s, 48 bytes each
+        assert_eq!(fixed, sig.to_bytes().to_vec());
     }
 
     #[test]
-    fn get_jwe_algorithm_rsa_oaep_sha512() {
-        use CryptoKeyVersionAlgorithm::*;
+    fn signing_error_classifies_as_crypto() {
+        assert!(!SigningError::MismatchedKeyInfo.is_retryable());
         assert_eq!(
-            get_jwe_algorithm(&RsaDecryptOaep4096Sha512),
-            Some("RSA-OAEP-512")
+            huskarl_core::Error::from(SigningError::MismatchedKeyInfo).kind(),
+            ErrorKind::Crypto
         );
     }
 
-    #[test]
-    fn get_jwe_algorithm_signing_key_returns_none() {
-        use CryptoKeyVersionAlgorithm::*;
-        assert_eq!(get_jwe_algorithm(&EcSignP256Sha256), None);
-        assert_eq!(get_jwe_algorithm(&RsaSignPss2048Sha256), None);
+    #[tokio::test]
+    async fn sign_converts_ecdsa_der_to_fixed_p1363() {
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+
+        let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let sig: Signature = sk.sign(b"jwt-signing-input");
+        // KMS hands back a DER-encoded ECDSA signature.
+        let mock = MockKms {
+            response_name: RESOURCE.to_owned(),
+            signature: sig.to_der().as_bytes().to_vec(),
+        };
+        let kv = signing_key_version(mock, "ES256");
+
+        // The signer must convert it to the fixed-width r||s JWS form.
+        let out = kv.sign(b"jwt-signing-input").await.unwrap();
+        assert_eq!(out, sig.to_bytes().to_vec());
+    }
+
+    #[tokio::test]
+    async fn sign_passes_through_non_ecdsa_signatures() {
+        let mock = MockKms {
+            response_name: RESOURCE.to_owned(),
+            signature: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let kv = signing_key_version(mock, "RS256");
+
+        // RSA signatures are already in the right form — returned verbatim.
+        assert_eq!(
+            kv.sign(b"data").await.unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_rejects_mismatched_key_name() {
+        let mock = MockKms {
+            response_name: "projects/p/.../cryptoKeyVersions/2".to_owned(),
+            signature: vec![1, 2, 3],
+        };
+        let kv = signing_key_version(mock, "RS256");
+
+        let err = kv.sign(b"data").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Crypto);
     }
 }

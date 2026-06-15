@@ -29,8 +29,10 @@ pub enum SetupError {
     },
 }
 
-impl huskarl_core::Error for SetupError {
-    fn is_retryable(&self) -> bool {
+impl SetupError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             SetupError::GetCryptoKeyVersion { source } => {
                 source.is_timeout() || source.is_exhausted()
@@ -69,8 +71,10 @@ pub enum KeyError {
     NoEnabledCryptoKeyVersions,
 }
 
-impl huskarl_core::Error for KeyError {
-    fn is_retryable(&self) -> bool {
+impl KeyError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             KeyError::ResolveVersion { source } => source.is_retryable(),
             KeyError::GetCryptoKeyVersion { source }

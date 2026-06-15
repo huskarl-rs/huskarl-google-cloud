@@ -2,7 +2,8 @@
 
 use bon::Builder;
 use google_cloud_secretmanager_v1::client::SecretManagerService;
-use huskarl_core::secrets::{DecodingError, Secret, SecretDecoder, SecretOutput};
+use huskarl_core::platform::MaybeSendBoxFuture;
+use huskarl_core::secrets::{Secret, SecretDecoder, SecretOutput};
 use snafu::prelude::*;
 
 pub use versions::ActiveSecretVersions;
@@ -27,16 +28,29 @@ pub enum SecretError {
     /// Failed to decode the secret data.
     Decode {
         /// The encoding error
-        source: DecodingError,
+        source: huskarl_core::Error,
     },
 }
 
-impl huskarl_core::Error for SecretError {
-    fn is_retryable(&self) -> bool {
+impl SecretError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             Self::AccessSecret { source } => source.is_exhausted() || source.is_timeout(),
             Self::MissingPayload | Self::Decode { .. } => false,
         }
+    }
+}
+
+impl From<SecretError> for huskarl_core::Error {
+    fn from(err: SecretError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Config
+        };
+        huskarl_core::Error::new(kind, err)
     }
 }
 
@@ -74,24 +88,108 @@ pub struct SecretVersion<D: SecretDecoder> {
 }
 
 impl<D: SecretDecoder> Secret for SecretVersion<D> {
-    type Error = SecretError;
     type Output = D::Output;
 
-    async fn get_secret_value(&self) -> Result<SecretOutput<Self::Output>, Self::Error> {
-        let response = self
-            .client
-            .access_secret_version()
-            .set_name(&self.resource_name)
-            .send()
-            .await
-            .context(AccessSecretSnafu)?;
+    fn get_secret_value(
+        &self,
+    ) -> MaybeSendBoxFuture<'_, Result<SecretOutput<Self::Output>, huskarl_core::Error>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .access_secret_version()
+                .set_name(&self.resource_name)
+                .send()
+                .await
+                .context(AccessSecretSnafu)?;
 
-        let payload = response.payload.context(MissingPayloadSnafu)?;
-        let secret_value = self.decoder.decode(&payload.data).context(DecodeSnafu)?;
+            let payload = response.payload.context(MissingPayloadSnafu)?;
+            let secret_value = self.decoder.decode(&payload.data).context(DecodeSnafu)?;
 
-        Ok(SecretOutput {
-            value: secret_value,
-            identity: response.name.rsplit('/').next().map(String::from),
+            Ok(SecretOutput {
+                value: secret_value,
+                identity: response.name.rsplit('/').next().map(String::from),
+            })
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::future::Future;
+
+    use google_cloud_gax::Result as GaxResult;
+    use google_cloud_gax::options::RequestOptions;
+    use google_cloud_gax::response::Response;
+    use google_cloud_secretmanager_v1::model::{
+        AccessSecretVersionRequest, AccessSecretVersionResponse, SecretPayload,
+    };
+    use google_cloud_secretmanager_v1::stub::SecretManagerService as SmStub;
+    use huskarl_core::ErrorKind;
+    use huskarl_core::secrets::encodings::StringEncoding;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Default)]
+    struct MockSm {
+        response_name: String,
+        /// `None` simulates a disabled/destroyed version with no payload.
+        data: Option<Vec<u8>>,
+    }
+
+    impl SmStub for MockSm {
+        fn access_secret_version(
+            &self,
+            _req: AccessSecretVersionRequest,
+            _options: RequestOptions,
+        ) -> impl Future<Output = GaxResult<Response<AccessSecretVersionResponse>>> + Send {
+            let mut resp =
+                AccessSecretVersionResponse::default().set_name(self.response_name.clone());
+            if let Some(data) = self.data.clone() {
+                resp = resp.set_payload(SecretPayload::default().set_data(data));
+            }
+            async move { Ok(Response::from(resp)) }
+        }
+    }
+
+    fn secret_version(mock: MockSm) -> SecretVersion<StringEncoding> {
+        SecretVersion::builder()
+            .decoder(StringEncoding)
+            .client(SecretManagerService::from_stub(mock))
+            .resource_name("projects/p/secrets/s/versions/3")
+            .build()
+    }
+
+    #[rstest]
+    #[case(SecretError::MissingPayload)]
+    #[case(SecretError::Decode { source: ErrorKind::Config.into() })]
+    fn secret_error_classifies_as_config(#[case] err: SecretError) {
+        assert!(!err.is_retryable());
+        assert_eq!(huskarl_core::Error::from(err).kind(), ErrorKind::Config);
+    }
+
+    #[tokio::test]
+    async fn get_secret_value_decodes_and_extracts_identity() {
+        let sv = secret_version(MockSm {
+            response_name: "projects/p/secrets/s/versions/7".to_owned(),
+            data: Some(b"  hunter2  ".to_vec()), // surrounding whitespace is trimmed
+        });
+
+        let out = sv.get_secret_value().await.unwrap();
+        assert_eq!(out.value.expose_secret(), "hunter2");
+        // Identity is the trailing version segment of the resolved name.
+        assert_eq!(out.identity.as_deref(), Some("7"));
+    }
+
+    #[tokio::test]
+    async fn get_secret_value_reports_missing_payload_as_config() {
+        let sv = secret_version(MockSm {
+            response_name: "projects/p/secrets/s/versions/7".to_owned(),
+            data: None,
+        });
+
+        let err = sv.get_secret_value().await.err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::Config);
     }
 }

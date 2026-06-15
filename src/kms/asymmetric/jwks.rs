@@ -182,8 +182,10 @@ pub enum JwksError {
     NoEnabledCryptoKeyVersions,
 }
 
-impl huskarl_core::Error for JwksError {
-    fn is_retryable(&self) -> bool {
+impl JwksError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             JwksError::ListCryptoKeyVersions { source } => {
                 source.is_timeout() || source.is_exhausted()

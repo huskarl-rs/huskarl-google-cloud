@@ -7,12 +7,10 @@ use bon::bon;
 use google_cloud_kms_v1::{
     client::KeyManagementService, model::crypto_key_version::CryptoKeyVersionAlgorithm,
 };
-use huskarl_core::BoxedError;
 use huskarl_core::crypto::KeyMatchStrength;
 use huskarl_core::crypto::signer::{JwsSigner, JwsSignerSelector};
-use huskarl_core::crypto::verifier::{
-    BoxedJwsVerifier, JwsVerifier, KeyMatch, MultiKeyVerifier, VerifyError,
-};
+use huskarl_core::crypto::verifier::{JwsVerifier, KeyMatch, MultiKeyVerifier, VerifyError};
+use huskarl_core::platform::MaybeSendBoxFuture;
 use snafu::prelude::*;
 
 use super::super::version::{self, VersionStrategy};
@@ -52,20 +50,46 @@ pub enum VerificationError {
     },
 }
 
-impl huskarl_core::Error for VerificationError {
-    fn is_retryable(&self) -> bool {
+impl VerificationError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             VerificationError::MacVerify { source } => source.is_timeout() || source.is_exhausted(),
         }
     }
 }
 
-impl huskarl_core::Error for SigningError {
-    fn is_retryable(&self) -> bool {
+impl From<VerificationError> for huskarl_core::Error {
+    fn from(err: VerificationError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
+    }
+}
+
+impl SigningError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             SigningError::MacSign { source } => source.is_timeout() || source.is_exhausted(),
             SigningError::MismatchedKeyInfo => false,
         }
+    }
+}
+
+impl From<SigningError> for huskarl_core::Error {
+    fn from(err: SigningError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
     }
 }
 
@@ -130,16 +154,12 @@ impl KeyVersion {
 }
 
 impl JwsSignerSelector for KeyVersion {
-    type Signer = Self;
-
-    fn select_signer(&self) -> Self::Signer {
-        self.clone()
+    fn select_signer(&self) -> Arc<dyn JwsSigner> {
+        Arc::new(self.clone())
     }
 }
 
 impl JwsSigner for KeyVersion {
-    type Error = SigningError;
-
     fn jws_algorithm(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.jws_algorithm)
     }
@@ -148,25 +168,30 @@ impl JwsSigner for KeyVersion {
         self.key_id.as_deref().map(Cow::Borrowed)
     }
 
-    async fn sign(&self, input: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        let response = self
-            .kms_client
-            .mac_sign()
-            .set_name(&self.resource_name)
-            .set_data(input.to_vec())
-            .send()
-            .await
-            .context(MacSignSnafu)?;
+    fn sign<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, huskarl_core::Error>> {
+        Box::pin(async move {
+            let response = self
+                .kms_client
+                .mac_sign()
+                .set_name(&self.resource_name)
+                .set_data(input.to_vec())
+                .send()
+                .await
+                .context(MacSignSnafu)?;
 
-        ensure!(response.name == self.resource_name, MismatchedKeyInfoSnafu);
+            if response.name != self.resource_name {
+                return Err(SigningError::MismatchedKeyInfo.into());
+            }
 
-        Ok(response.mac.to_vec())
+            Ok(response.mac.to_vec())
+        })
     }
 }
 
 impl JwsVerifier for KeyVersion {
-    type Error = VerificationError;
-
     fn key_match(&self, key_match: &KeyMatch<'_>) -> Option<KeyMatchStrength> {
         if key_match.alg != self.jws_algorithm {
             return None;
@@ -178,28 +203,30 @@ impl JwsVerifier for KeyVersion {
         }
     }
 
-    async fn verify(
-        &self,
-        input: &[u8],
-        signature: &[u8],
-        _key_match: &KeyMatch<'_>,
-    ) -> Result<(), VerifyError<Self::Error>> {
-        let response = self
-            .kms_client
-            .mac_verify()
-            .set_name(&self.resource_name)
-            .set_data(input.to_vec())
-            .set_mac(signature.to_vec())
-            .send()
-            .await
-            .context(MacVerifySnafu)
-            .map_err(|source| VerifyError::Other { source })?;
+    fn verify<'a>(
+        &'a self,
+        input: &'a [u8],
+        signature: &'a [u8],
+        _key_match: &'a KeyMatch<'a>,
+    ) -> MaybeSendBoxFuture<'a, Result<(), VerifyError>> {
+        Box::pin(async move {
+            let response = self
+                .kms_client
+                .mac_verify()
+                .set_name(&self.resource_name)
+                .set_data(input.to_vec())
+                .set_mac(signature.to_vec())
+                .send()
+                .await
+                .context(MacVerifySnafu)
+                .map_err(huskarl_core::Error::from)?;
 
-        if response.success {
-            Ok(())
-        } else {
-            Err(VerifyError::SignatureMismatch)
-        }
+            if response.success {
+                Ok(())
+            } else {
+                Err(VerifyError::SignatureMismatch)
+            }
+        })
     }
 }
 
@@ -297,16 +324,12 @@ impl SigningKey {
 }
 
 impl JwsSignerSelector for SigningKey {
-    type Signer = KeyVersion;
-
-    fn select_signer(&self) -> KeyVersion {
-        self.key_version.clone()
+    fn select_signer(&self) -> Arc<dyn JwsSigner> {
+        Arc::new(self.key_version.clone())
     }
 }
 
 impl JwsSigner for SigningKey {
-    type Error = SigningError;
-
     fn jws_algorithm(&self) -> Cow<'_, str> {
         self.key_version.jws_algorithm()
     }
@@ -315,8 +338,11 @@ impl JwsSigner for SigningKey {
         self.key_version.key_id()
     }
 
-    async fn sign(&self, input: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        self.key_version.sign(input).await
+    fn sign<'a>(
+        &'a self,
+        input: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, huskarl_core::Error>> {
+        self.key_version.sign(input)
     }
 }
 
@@ -404,8 +430,13 @@ impl VerifyingKey {
             .collect();
 
         let verifier = Arc::new(
-            MultiKeyVerifier::new(versions.into_iter().map(BoxedJwsVerifier::new).collect())
-                .try_all_on_ambiguous_match(true),
+            MultiKeyVerifier::new(
+                versions
+                    .into_iter()
+                    .map(|v| Arc::new(v) as Arc<dyn JwsVerifier>)
+                    .collect(),
+            )
+            .try_all_on_ambiguous_match(true),
         );
 
         Ok(Self { verifier })
@@ -413,19 +444,17 @@ impl VerifyingKey {
 }
 
 impl JwsVerifier for VerifyingKey {
-    type Error = BoxedError;
-
     fn key_match(&self, key_match: &KeyMatch<'_>) -> Option<KeyMatchStrength> {
         self.verifier.key_match(key_match)
     }
 
-    async fn verify(
-        &self,
-        input: &[u8],
-        signature: &[u8],
-        key_match: &KeyMatch<'_>,
-    ) -> Result<(), VerifyError<Self::Error>> {
-        self.verifier.verify(input, signature, key_match).await
+    fn verify<'a>(
+        &'a self,
+        input: &'a [u8],
+        signature: &'a [u8],
+        key_match: &'a KeyMatch<'a>,
+    ) -> MaybeSendBoxFuture<'a, Result<(), VerifyError>> {
+        self.verifier.verify(input, signature, key_match)
     }
 }
 
@@ -475,5 +504,156 @@ fn get_jws_algorithm(algorithm: &CryptoKeyVersionAlgorithm) -> Option<&'static s
         HmacSha384 => Some("HS384"),
         HmacSha512 => Some("HS512"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::future::Future;
+
+    use google_cloud_gax::Result as GaxResult;
+    use google_cloud_gax::options::RequestOptions;
+    use google_cloud_gax::response::Response;
+    use google_cloud_kms_v1::model::{
+        MacSignRequest, MacSignResponse, MacVerifyRequest, MacVerifyResponse,
+    };
+    use google_cloud_kms_v1::stub::KeyManagementService as KmsStub;
+    use huskarl_core::ErrorKind;
+    use rstest::rstest;
+
+    use super::*;
+
+    const RESOURCE: &str = "projects/p/.../cryptoKeyVersions/1";
+
+    #[derive(Debug, Clone, Default)]
+    struct MockKms {
+        response_name: String,
+        mac: Vec<u8>,
+        verify_success: bool,
+    }
+
+    impl KmsStub for MockKms {
+        fn mac_sign(
+            &self,
+            _req: MacSignRequest,
+            _options: RequestOptions,
+        ) -> impl Future<Output = GaxResult<Response<MacSignResponse>>> + Send {
+            let resp = MacSignResponse::default()
+                .set_name(self.response_name.clone())
+                .set_mac(self.mac.clone());
+            async move { Ok(Response::from(resp)) }
+        }
+
+        fn mac_verify(
+            &self,
+            _req: MacVerifyRequest,
+            _options: RequestOptions,
+        ) -> impl Future<Output = GaxResult<Response<MacVerifyResponse>>> + Send {
+            let resp = MacVerifyResponse::default().set_success(self.verify_success);
+            async move { Ok(Response::from(resp)) }
+        }
+    }
+
+    fn key_version(mock: MockKms, jws_algorithm: &str, key_id: Option<&str>) -> KeyVersion {
+        KeyVersion {
+            kms_client: KeyManagementService::from_stub(mock),
+            resource_name: RESOURCE.to_owned(),
+            jws_algorithm: jws_algorithm.to_owned(),
+            key_id: key_id.map(str::to_owned),
+        }
+    }
+
+    #[rstest]
+    #[case(CryptoKeyVersionAlgorithm::HmacSha256, Some("HS256"))]
+    #[case(CryptoKeyVersionAlgorithm::HmacSha384, Some("HS384"))]
+    #[case(CryptoKeyVersionAlgorithm::HmacSha512, Some("HS512"))]
+    #[case(CryptoKeyVersionAlgorithm::Aes256Gcm, None)]
+    fn get_jws_algorithm_maps_hmac_algorithms(
+        #[case] algorithm: CryptoKeyVersionAlgorithm,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(get_jws_algorithm(&algorithm), expected);
+    }
+
+    #[test]
+    fn signing_error_classifies_as_crypto() {
+        let err = SigningError::MismatchedKeyInfo;
+        assert!(!err.is_retryable());
+        assert_eq!(huskarl_core::Error::from(err).kind(), ErrorKind::Crypto);
+    }
+
+    #[rstest]
+    #[case("HS256", Some("k1"), Some("k1"), Some(KeyMatchStrength::ByKeyId))]
+    #[case("HS256", None, Some("k1"), Some(KeyMatchStrength::ByAlgorithm))]
+    #[case("HS256", Some("k2"), Some("k1"), None)]
+    #[case("HS384", Some("k1"), Some("k1"), None)] // alg mismatch
+    #[case("HS256", None, None, Some(KeyMatchStrength::ByAlgorithm))]
+    fn key_match_applies_alg_and_kid_rules(
+        #[case] req_alg: &str,
+        #[case] req_kid: Option<&str>,
+        #[case] registered_kid: Option<&str>,
+        #[case] expected: Option<KeyMatchStrength>,
+    ) {
+        let kv = key_version(MockKms::default(), "HS256", registered_kid);
+        let m = KeyMatch {
+            alg: req_alg,
+            kid: req_kid,
+        };
+        assert_eq!(kv.key_match(&m), expected);
+    }
+
+    #[tokio::test]
+    async fn sign_returns_the_mac() {
+        let mock = MockKms {
+            response_name: RESOURCE.to_owned(),
+            mac: vec![0xAA, 0xBB, 0xCC],
+            ..Default::default()
+        };
+        let kv = key_version(mock, "HS256", None);
+        assert_eq!(kv.sign(b"data").await.unwrap(), vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[tokio::test]
+    async fn sign_rejects_mismatched_key_name() {
+        let mock = MockKms {
+            response_name: "projects/p/.../cryptoKeyVersions/2".to_owned(),
+            mac: vec![1],
+            ..Default::default()
+        };
+        let kv = key_version(mock, "HS256", None);
+        let err = kv.sign(b"data").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Crypto);
+    }
+
+    #[tokio::test]
+    async fn verify_accepts_a_successful_mac() {
+        let mock = MockKms {
+            verify_success: true,
+            ..Default::default()
+        };
+        let kv = key_version(mock, "HS256", None);
+        let m = KeyMatch {
+            alg: "HS256",
+            kid: None,
+        };
+        assert!(kv.verify(b"data", b"sig", &m).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_reports_signature_mismatch() {
+        let mock = MockKms {
+            verify_success: false,
+            ..Default::default()
+        };
+        let kv = key_version(mock, "HS256", None);
+        let m = KeyMatch {
+            alg: "HS256",
+            kid: None,
+        };
+        assert!(matches!(
+            kv.verify(b"data", b"sig", &m).await,
+            Err(VerifyError::SignatureMismatch)
+        ));
     }
 }

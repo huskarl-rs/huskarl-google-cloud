@@ -9,9 +9,10 @@ use google_cloud_kms_v1::{
 };
 use huskarl_core::crypto::KeyMatchStrength;
 use huskarl_core::crypto::cipher::{
-    AeadCipherSelector, AeadDecryptor, AeadEncryptor, AeadOutput, BoxedAeadDecryptor, CipherMatch,
-    MultiKeyDecryptor, MultiKeyDecryptorError,
+    AeadCipherSelector, AeadDecryptor, AeadEncryptor, AeadOutput, CipherMatch, DecryptError,
+    MultiKeyDecryptor,
 };
+use huskarl_core::platform::MaybeSendBoxFuture;
 use snafu::prelude::*;
 
 use super::super::version::{self, VersionStrategy};
@@ -51,8 +52,10 @@ pub enum DecryptionError {
     },
 }
 
-impl huskarl_core::Error for EncryptionError {
-    fn is_retryable(&self) -> bool {
+impl EncryptionError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             EncryptionError::RawEncrypt { source } => source.is_timeout() || source.is_exhausted(),
             EncryptionError::MismatchedKeyInfo => false,
@@ -60,11 +63,35 @@ impl huskarl_core::Error for EncryptionError {
     }
 }
 
-impl huskarl_core::Error for DecryptionError {
-    fn is_retryable(&self) -> bool {
+impl From<EncryptionError> for huskarl_core::Error {
+    fn from(err: EncryptionError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
+    }
+}
+
+impl DecryptionError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             DecryptionError::RawDecrypt { source } => source.is_timeout() || source.is_exhausted(),
         }
+    }
+}
+
+impl From<DecryptionError> for huskarl_core::Error {
+    fn from(err: DecryptionError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
     }
 }
 
@@ -130,16 +157,12 @@ impl KeyVersion {
 }
 
 impl AeadCipherSelector for KeyVersion {
-    type Encryptor = Self;
-
-    fn select_cipher(&self) -> Self::Encryptor {
-        self.clone()
+    fn select_cipher(&self) -> Arc<dyn AeadEncryptor> {
+        Arc::new(self.clone())
     }
 }
 
 impl AeadEncryptor for KeyVersion {
-    type Error = EncryptionError;
-
     fn enc_algorithm(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.enc_algorithm)
     }
@@ -148,40 +171,46 @@ impl AeadEncryptor for KeyVersion {
         self.key_id.as_deref().map(Cow::Borrowed)
     }
 
-    async fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<AeadOutput, Self::Error> {
-        let response = self
-            .kms_client
-            .raw_encrypt()
-            .set_name(&self.resource_name)
-            .set_plaintext(plaintext.to_vec())
-            .set_additional_authenticated_data(aad.to_vec())
-            // initialization_vector is omitted: KMS generates it and returns it
-            .send()
-            .await
-            .context(RawEncryptSnafu)?;
+    fn encrypt<'a>(
+        &'a self,
+        plaintext: &'a [u8],
+        aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<AeadOutput, huskarl_core::Error>> {
+        Box::pin(async move {
+            let response = self
+                .kms_client
+                .raw_encrypt()
+                .set_name(&self.resource_name)
+                .set_plaintext(plaintext.to_vec())
+                .set_additional_authenticated_data(aad.to_vec())
+                // initialization_vector is omitted: KMS generates it and returns it
+                .send()
+                .await
+                .context(RawEncryptSnafu)?;
 
-        ensure!(response.name == self.resource_name, MismatchedKeyInfoSnafu);
+            if response.name != self.resource_name {
+                return Err(EncryptionError::MismatchedKeyInfo.into());
+            }
 
-        let tag_length = usize::try_from(response.tag_length).unwrap_or(0);
-        let ct_with_tag = response.ciphertext;
+            let tag_length = usize::try_from(response.tag_length).unwrap_or(0);
+            let ct_with_tag = response.ciphertext;
 
-        // The tag is appended to the end of the ciphertext by KMS.
-        let split_at = ct_with_tag.len().saturating_sub(tag_length);
-        let ciphertext = ct_with_tag[..split_at].to_vec();
-        let tag = ct_with_tag[split_at..].to_vec();
-        let nonce = response.initialization_vector.to_vec();
+            // The tag is appended to the end of the ciphertext by KMS.
+            let split_at = ct_with_tag.len().saturating_sub(tag_length);
+            let ciphertext = ct_with_tag[..split_at].to_vec();
+            let tag = ct_with_tag[split_at..].to_vec();
+            let nonce = response.initialization_vector.to_vec();
 
-        Ok(AeadOutput {
-            nonce,
-            ciphertext,
-            tag,
+            Ok(AeadOutput {
+                nonce,
+                ciphertext,
+                tag,
+            })
         })
     }
 }
 
 impl AeadDecryptor for KeyVersion {
-    type Error = DecryptionError;
-
     fn cipher_match(&self, m: &CipherMatch<'_>) -> Option<KeyMatchStrength> {
         if let Some(enc) = m.enc
             && enc != self.enc_algorithm
@@ -195,32 +224,35 @@ impl AeadDecryptor for KeyVersion {
         }
     }
 
-    async fn decrypt(
-        &self,
-        _cipher_match: Option<&CipherMatch<'_>>,
-        nonce: &[u8],
-        ciphertext: &[u8],
-        tag: &[u8],
-        aad: &[u8],
-    ) -> Result<Vec<u8>, Self::Error> {
-        // KMS RawDecrypt expects the tag appended to the ciphertext.
-        let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + tag.len());
-        ct_with_tag.extend_from_slice(ciphertext);
-        ct_with_tag.extend_from_slice(tag);
+    fn decrypt<'a>(
+        &'a self,
+        _cipher_match: Option<&'a CipherMatch<'a>>,
+        nonce: &'a [u8],
+        ciphertext: &'a [u8],
+        tag: &'a [u8],
+        aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, DecryptError>> {
+        Box::pin(async move {
+            // KMS RawDecrypt expects the tag appended to the ciphertext.
+            let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + tag.len());
+            ct_with_tag.extend_from_slice(ciphertext);
+            ct_with_tag.extend_from_slice(tag);
 
-        let response = self
-            .kms_client
-            .raw_decrypt()
-            .set_name(&self.resource_name)
-            .set_ciphertext(ct_with_tag)
-            .set_initialization_vector(nonce.to_vec())
-            .set_additional_authenticated_data(aad.to_vec())
-            .set_tag_length(i32::try_from(tag.len()).unwrap_or(16))
-            .send()
-            .await
-            .context(RawDecryptSnafu)?;
+            let response = self
+                .kms_client
+                .raw_decrypt()
+                .set_name(&self.resource_name)
+                .set_ciphertext(ct_with_tag)
+                .set_initialization_vector(nonce.to_vec())
+                .set_additional_authenticated_data(aad.to_vec())
+                .set_tag_length(i32::try_from(tag.len()).unwrap_or(16))
+                .send()
+                .await
+                .context(RawDecryptSnafu)
+                .map_err(huskarl_core::Error::from)?;
 
-        Ok(response.plaintext.to_vec())
+            Ok(response.plaintext.to_vec())
+        })
     }
 }
 
@@ -292,16 +324,12 @@ impl EncryptionKey {
 }
 
 impl AeadCipherSelector for EncryptionKey {
-    type Encryptor = KeyVersion;
-
-    fn select_cipher(&self) -> KeyVersion {
-        self.key_version.clone()
+    fn select_cipher(&self) -> Arc<dyn AeadEncryptor> {
+        Arc::new(self.key_version.clone())
     }
 }
 
 impl AeadEncryptor for EncryptionKey {
-    type Error = EncryptionError;
-
     fn enc_algorithm(&self) -> Cow<'_, str> {
         self.key_version.enc_algorithm()
     }
@@ -310,8 +338,12 @@ impl AeadEncryptor for EncryptionKey {
         self.key_version.key_id()
     }
 
-    async fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<AeadOutput, Self::Error> {
-        self.key_version.encrypt(plaintext, aad).await
+    fn encrypt<'a>(
+        &'a self,
+        plaintext: &'a [u8],
+        aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<AeadOutput, huskarl_core::Error>> {
+        self.key_version.encrypt(plaintext, aad)
     }
 }
 
@@ -387,30 +419,30 @@ impl DecryptionKey {
         )
         .await?;
         let decryptor = Arc::new(MultiKeyDecryptor::new(
-            versions.into_iter().map(BoxedAeadDecryptor::new).collect(),
+            versions
+                .into_iter()
+                .map(|kv| Arc::new(kv) as Arc<dyn AeadDecryptor>)
+                .collect(),
         ));
         Ok(Self { decryptor })
     }
 }
 
 impl AeadDecryptor for DecryptionKey {
-    type Error = MultiKeyDecryptorError;
-
     fn cipher_match(&self, m: &CipherMatch<'_>) -> Option<KeyMatchStrength> {
         self.decryptor.cipher_match(m)
     }
 
-    async fn decrypt(
-        &self,
-        cipher_match: Option<&CipherMatch<'_>>,
-        nonce: &[u8],
-        ciphertext: &[u8],
-        tag: &[u8],
-        aad: &[u8],
-    ) -> Result<Vec<u8>, Self::Error> {
+    fn decrypt<'a>(
+        &'a self,
+        cipher_match: Option<&'a CipherMatch<'a>>,
+        nonce: &'a [u8],
+        ciphertext: &'a [u8],
+        tag: &'a [u8],
+        aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, DecryptError>> {
         self.decryptor
             .decrypt(cipher_match, nonce, ciphertext, tag, aad)
-            .await
     }
 }
 
@@ -501,7 +533,10 @@ impl CipherKey {
         };
         let decryption = DecryptionKey {
             decryptor: Arc::new(MultiKeyDecryptor::new(
-                dec_kvs.into_iter().map(BoxedAeadDecryptor::new).collect(),
+                dec_kvs
+                    .into_iter()
+                    .map(|kv| Arc::new(kv) as Arc<dyn AeadDecryptor>)
+                    .collect(),
             )),
         };
         Ok(Self {
@@ -512,16 +547,12 @@ impl CipherKey {
 }
 
 impl AeadCipherSelector for CipherKey {
-    type Encryptor = KeyVersion;
-
-    fn select_cipher(&self) -> KeyVersion {
-        self.encryption.key_version.clone()
+    fn select_cipher(&self) -> Arc<dyn AeadEncryptor> {
+        Arc::new(self.encryption.key_version.clone())
     }
 }
 
 impl AeadEncryptor for CipherKey {
-    type Error = EncryptionError;
-
     fn enc_algorithm(&self) -> Cow<'_, str> {
         self.encryption.enc_algorithm()
     }
@@ -530,29 +561,30 @@ impl AeadEncryptor for CipherKey {
         self.encryption.key_id()
     }
 
-    async fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<AeadOutput, Self::Error> {
-        self.encryption.encrypt(plaintext, aad).await
+    fn encrypt<'a>(
+        &'a self,
+        plaintext: &'a [u8],
+        aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<AeadOutput, huskarl_core::Error>> {
+        self.encryption.encrypt(plaintext, aad)
     }
 }
 
 impl AeadDecryptor for CipherKey {
-    type Error = MultiKeyDecryptorError;
-
     fn cipher_match(&self, m: &CipherMatch<'_>) -> Option<KeyMatchStrength> {
         self.decryption.cipher_match(m)
     }
 
-    async fn decrypt(
-        &self,
-        cipher_match: Option<&CipherMatch<'_>>,
-        nonce: &[u8],
-        ciphertext: &[u8],
-        tag: &[u8],
-        aad: &[u8],
-    ) -> Result<Vec<u8>, Self::Error> {
+    fn decrypt<'a>(
+        &'a self,
+        cipher_match: Option<&'a CipherMatch<'a>>,
+        nonce: &'a [u8],
+        ciphertext: &'a [u8],
+        tag: &'a [u8],
+        aad: &'a [u8],
+    ) -> MaybeSendBoxFuture<'a, Result<Vec<u8>, DecryptError>> {
         self.decryption
             .decrypt(cipher_match, nonce, ciphertext, tag, aad)
-            .await
     }
 }
 
@@ -673,5 +705,154 @@ fn get_enc_algorithm(algorithm: &CryptoKeyVersionAlgorithm) -> Option<&'static s
         Aes128Gcm => Some("A128GCM"),
         Aes256Gcm => Some("A256GCM"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::future::Future;
+
+    use google_cloud_gax::Result as GaxResult;
+    use google_cloud_gax::options::RequestOptions;
+    use google_cloud_gax::response::Response;
+    use google_cloud_kms_v1::model::{
+        RawDecryptRequest, RawDecryptResponse, RawEncryptRequest, RawEncryptResponse,
+    };
+    use google_cloud_kms_v1::stub::KeyManagementService as KmsStub;
+    use huskarl_core::ErrorKind;
+    use rstest::rstest;
+
+    use super::*;
+
+    /// A canned KMS stub. `raw_encrypt` returns the configured bundle; `raw_decrypt`
+    /// echoes the request ciphertext back as plaintext so a test can assert how the
+    /// `[ciphertext || tag]` buffer was assembled.
+    #[derive(Debug, Clone, Default)]
+    struct MockKms {
+        response_name: String,
+        ciphertext: Vec<u8>,
+        tag_length: i32,
+        iv: Vec<u8>,
+    }
+
+    impl KmsStub for MockKms {
+        fn raw_encrypt(
+            &self,
+            _req: RawEncryptRequest,
+            _options: RequestOptions,
+        ) -> impl Future<Output = GaxResult<Response<RawEncryptResponse>>> + Send {
+            let resp = RawEncryptResponse::default()
+                .set_name(self.response_name.clone())
+                .set_ciphertext(self.ciphertext.clone())
+                .set_tag_length(self.tag_length)
+                .set_initialization_vector(self.iv.clone());
+            async move { Ok(Response::from(resp)) }
+        }
+
+        fn raw_decrypt(
+            &self,
+            req: RawDecryptRequest,
+            _options: RequestOptions,
+        ) -> impl Future<Output = GaxResult<Response<RawDecryptResponse>>> + Send {
+            // Echo the assembled ciphertext back so the test can inspect it.
+            let resp = RawDecryptResponse::default().set_plaintext(req.ciphertext);
+            async move { Ok(Response::from(resp)) }
+        }
+    }
+
+    fn key_version(mock: MockKms, enc_algorithm: &str, key_id: Option<&str>) -> KeyVersion {
+        KeyVersion {
+            kms_client: KeyManagementService::from_stub(mock),
+            resource_name: "projects/p/.../cryptoKeyVersions/1".to_owned(),
+            enc_algorithm: enc_algorithm.to_owned(),
+            key_id: key_id.map(str::to_owned),
+        }
+    }
+
+    #[rstest]
+    #[case(CryptoKeyVersionAlgorithm::Aes128Gcm, Some("A128GCM"))]
+    #[case(CryptoKeyVersionAlgorithm::Aes256Gcm, Some("A256GCM"))]
+    #[case(CryptoKeyVersionAlgorithm::HmacSha256, None)]
+    fn get_enc_algorithm_maps_aead_algorithms(
+        #[case] algorithm: CryptoKeyVersionAlgorithm,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(get_enc_algorithm(&algorithm), expected);
+    }
+
+    #[test]
+    fn encryption_error_classifies_as_crypto() {
+        let err = EncryptionError::MismatchedKeyInfo;
+        assert!(!err.is_retryable());
+        assert_eq!(huskarl_core::Error::from(err).kind(), ErrorKind::Crypto);
+    }
+
+    #[rstest]
+    // enc matches, kids match -> ByKeyId
+    #[case(Some("A256GCM"), Some("k1"), Some("k1"), Some(KeyMatchStrength::ByKeyId))]
+    // enc matches, no requested kid -> ByAlgorithm
+    #[case(Some("A256GCM"), None, Some("k1"), Some(KeyMatchStrength::ByAlgorithm))]
+    // enc matches, kids differ -> None
+    #[case(Some("A256GCM"), Some("k2"), Some("k1"), None)]
+    // enc mismatch -> None
+    #[case(Some("A128GCM"), None, None, None)]
+    // no enc requested -> ByAlgorithm
+    #[case(None, None, None, Some(KeyMatchStrength::ByAlgorithm))]
+    fn cipher_match_applies_alg_and_kid_rules(
+        #[case] req_enc: Option<&str>,
+        #[case] req_kid: Option<&str>,
+        #[case] registered_kid: Option<&str>,
+        #[case] expected: Option<KeyMatchStrength>,
+    ) {
+        let kv = key_version(MockKms::default(), "A256GCM", registered_kid);
+        let m = CipherMatch::builder()
+            .maybe_enc(req_enc)
+            .maybe_kid(req_kid)
+            .build();
+        assert_eq!(kv.cipher_match(&m), expected);
+    }
+
+    #[tokio::test]
+    async fn encrypt_splits_tag_off_the_ciphertext() {
+        let mock = MockKms {
+            response_name: "projects/p/.../cryptoKeyVersions/1".to_owned(),
+            // [ ciphertext (3) || tag (4) ], tag appended by KMS.
+            ciphertext: vec![0xC0, 0xC1, 0xC2, 0xD0, 0xD1, 0xD2, 0xD3],
+            tag_length: 4,
+            iv: vec![0x9A, 0x9B],
+        };
+        let kv = key_version(mock, "A256GCM", None);
+
+        let out = kv.encrypt(b"plaintext", b"aad").await.unwrap();
+        assert_eq!(out.nonce, vec![0x9A, 0x9B]);
+        assert_eq!(out.ciphertext, vec![0xC0, 0xC1, 0xC2]);
+        assert_eq!(out.tag, vec![0xD0, 0xD1, 0xD2, 0xD3]);
+    }
+
+    #[tokio::test]
+    async fn encrypt_rejects_mismatched_key_name() {
+        let mock = MockKms {
+            response_name: "projects/p/.../cryptoKeyVersions/2".to_owned(), // rotated under us
+            ciphertext: vec![1, 2, 3, 4],
+            tag_length: 1,
+            iv: vec![0],
+        };
+        let kv = key_version(mock, "A256GCM", None);
+
+        let err = kv.encrypt(b"plaintext", b"aad").await.err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::Crypto);
+    }
+
+    #[tokio::test]
+    async fn decrypt_appends_tag_to_ciphertext_for_kms() {
+        let kv = key_version(MockKms::default(), "A256GCM", None);
+
+        // The stub echoes back the buffer it received as plaintext.
+        let echoed = kv
+            .decrypt(None, b"nonce", &[0xAA, 0xBB], &[0xCC, 0xDD], b"aad")
+            .await
+            .unwrap();
+        assert_eq!(echoed, vec![0xAA, 0xBB, 0xCC, 0xDD]);
     }
 }

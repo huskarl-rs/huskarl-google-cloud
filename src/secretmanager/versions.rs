@@ -28,8 +28,10 @@ pub enum SecretVersionsError {
     PrimaryVersionNotFound,
 }
 
-impl huskarl_core::Error for SecretVersionsError {
-    fn is_retryable(&self) -> bool {
+impl SecretVersionsError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             Self::GetSecretVersion { source } | Self::ListSecretVersions { source } => {
                 source.is_exhausted() || source.is_timeout()
@@ -66,7 +68,7 @@ impl<D: SecretDecoder> ActiveSecretVersions<D> {
     /// Returns an error if any secret value fetch fails.
     pub async fn get_all_values(
         &self,
-    ) -> Result<(SecretOutput<D::Output>, Vec<SecretOutput<D::Output>>), super::SecretError> {
+    ) -> Result<(SecretOutput<D::Output>, Vec<SecretOutput<D::Output>>), huskarl_core::Error> {
         futures_util::future::try_join(
             self.primary.get_secret_value(),
             futures_util::future::try_join_all(
@@ -144,7 +146,7 @@ pub struct SecretVersions<D: SecretDecoder> {
     max_versions: Option<usize>,
 }
 
-impl<D: SecretDecoder> SecretVersions<D> {
+impl<D: SecretDecoder + Clone> SecretVersions<D> {
     /// Returns a handle to the primary secret version.
     ///
     /// This is a synchronous operation — it constructs a [`SecretVersion`]

@@ -41,8 +41,10 @@ pub enum VersionResolutionError {
     },
 }
 
-impl huskarl_core::Error for VersionResolutionError {
-    fn is_retryable(&self) -> bool {
+impl VersionResolutionError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
         match self {
             Self::GetCryptoKey { source } | Self::ListCryptoKeyVersions { source } => {
                 source.is_timeout() || source.is_exhausted()
@@ -231,4 +233,86 @@ async fn resolve_version_by_label(
         .get(label)
         .cloned()
         .context(VersionLabelNotFoundSnafu { label })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::time::UNIX_EPOCH;
+
+    use google_cloud_wkt::Timestamp;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/42", "42")]
+    #[case("projects/p/.../cryptoKeyVersions/primary", "primary")]
+    #[case("1", "1")]
+    #[case("", "")]
+    fn version_id_from_resource_name_extracts_trailing_segment(
+        #[case] resource_name: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(version_id_from_resource_name(resource_name), expected);
+    }
+
+    fn now_secs() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+    }
+
+    /// Build a newest-first list of versions, each with a `create_time` at the
+    /// given age (in seconds) before now.
+    fn versions(ages_secs: &[(&str, i64)]) -> Vec<CryptoKeyVersion> {
+        let now = now_secs();
+        ages_secs
+            .iter()
+            .map(|(name, age)| {
+                CryptoKeyVersion::default()
+                    .set_name(*name)
+                    .set_create_time(Timestamp::clamp(now - age, 0))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn select_min_age_picks_newest_version_past_the_threshold() {
+        // Newest-first: v3 is 10s old (too new), v2 is 100s old, v1 is 1000s old.
+        let vs = versions(&[
+            (".../cryptoKeyVersions/3", 10),
+            (".../cryptoKeyVersions/2", 100),
+            (".../cryptoKeyVersions/1", 1000),
+        ]);
+        // With a 60s minimum age, v3 is skipped and v2 (the newest old-enough) wins.
+        assert_eq!(select_min_age_id(&vs, &Duration::from_secs(60)), "2");
+    }
+
+    #[test]
+    fn select_min_age_falls_back_to_newest_when_none_old_enough() {
+        let vs = versions(&[
+            (".../cryptoKeyVersions/3", 5),
+            (".../cryptoKeyVersions/2", 10),
+        ]);
+        // No version is 3600s old; fall back to the newest (first) version.
+        assert_eq!(select_min_age_id(&vs, &Duration::from_secs(3600)), "3");
+    }
+
+    #[test]
+    fn select_min_age_ignores_versions_without_create_time() {
+        let now = now_secs();
+        let vs = vec![
+            // Newest, but no create_time — not eligible for the age check.
+            CryptoKeyVersion::default().set_name(".../cryptoKeyVersions/3"),
+            CryptoKeyVersion::default()
+                .set_name(".../cryptoKeyVersions/2")
+                .set_create_time(Timestamp::clamp(now - 1000, 0)),
+        ];
+        assert_eq!(select_min_age_id(&vs, &Duration::from_secs(60)), "2");
+    }
 }
