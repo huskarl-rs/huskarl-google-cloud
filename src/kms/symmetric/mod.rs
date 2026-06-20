@@ -2,6 +2,10 @@
 //!
 //! - [`cipher`] — AEAD raw encrypt/decrypt (`RAW_ENCRYPT_DECRYPT` key purpose)
 //! - [`signer`] — HMAC signing and verification (`MAC` key purpose)
+//!
+//! Encryption and signing pin a single key version; decryption and verification
+//! span all enabled versions. See the [parent module](super) for the version
+//! and rotation model.
 
 pub mod cipher;
 pub mod signer;
@@ -11,7 +15,8 @@ use snafu::prelude::*;
 
 use super::version::VersionResolutionError;
 
-/// Errors that can occur when building a [`KeyVersion`](cipher::KeyVersion) directly.
+/// Errors that can occur when building a [`cipher::KeyVersion`] or
+/// [`signer::KeyVersion`] directly.
 #[derive(Debug, Snafu)]
 #[snafu(module(setup))]
 #[non_exhaustive]
@@ -42,7 +47,8 @@ impl SetupError {
     }
 }
 
-/// Errors that can occur when resolving key versions via a `Key`.
+/// Errors that can occur when resolving key versions via the higher-level key
+/// builders (e.g. [`cipher::CipherKey`], [`signer::SigningKey`]).
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
 pub enum KeyError {

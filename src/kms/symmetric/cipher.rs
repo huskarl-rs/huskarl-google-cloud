@@ -790,7 +790,12 @@ mod tests {
 
     #[rstest]
     // enc matches, kids match -> ByKeyId
-    #[case(Some("A256GCM"), Some("k1"), Some("k1"), Some(KeyMatchStrength::ByKeyId))]
+    #[case(
+        Some("A256GCM"),
+        Some("k1"),
+        Some("k1"),
+        Some(KeyMatchStrength::ByKeyId)
+    )]
     // enc matches, no requested kid -> ByAlgorithm
     #[case(Some("A256GCM"), None, Some("k1"), Some(KeyMatchStrength::ByAlgorithm))]
     // enc matches, kids differ -> None

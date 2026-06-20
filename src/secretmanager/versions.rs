@@ -60,8 +60,8 @@ impl<D: SecretDecoder> ActiveSecretVersions<D> {
     /// Fetch the secret values for the primary version and all enabled
     /// versions concurrently.
     ///
-    /// Returns `(primary_value, all_values)`. The primary value is also
-    /// present somewhere in `all_values` (the order matches [`all`](Self::all)).
+    /// Returns `(primary_value, all_values)`, where `all_values` is aligned
+    /// positionally with [`all`](Self::all); `primary_value` is one of its entries.
     ///
     /// # Errors
     ///

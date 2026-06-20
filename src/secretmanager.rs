@@ -69,11 +69,11 @@ impl From<SecretError> for huskarl_core::Error {
 /// # use google_cloud_secretmanager_v1::client::SecretManagerService;
 ///
 /// # async fn setup(secret_manager: SecretManagerService) {
-///   let secret = SecretVersion::builder()
-///   .decoder(StringEncoding)
-///   .client(secret_manager)
-///   .resource_name("projects/boogawooga/secrets/my-private-secret/versions/1")
-///   .build();
+///     let secret = SecretVersion::builder()
+///         .decoder(StringEncoding)
+///         .client(secret_manager)
+///         .resource_name("projects/boogawooga/secrets/my-private-secret/versions/1")
+///         .build();
 /// # }
 /// ```
 #[derive(Debug, Clone, Builder)]

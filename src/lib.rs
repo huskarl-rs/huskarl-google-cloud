@@ -5,10 +5,15 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
 #![warn(clippy::pedantic)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! Google Cloud Platform crypto integrations.
+//! Google Cloud Platform crypto integrations for `huskarl`.
 //!
-//! Implements `huskarl` traits for GCP services.
+//! - `kms` — Cloud KMS signers, verifiers, and AEAD ciphers (asymmetric JWS,
+//!   symmetric HMAC and AES), with version pinning and rotation support.
+//! - `secretmanager` — a `huskarl` secret provider backed by Secret Manager.
+//!
+//! Each lives behind a cargo feature of the same name.
 
 #[cfg(feature = "kms")]
 pub mod kms;

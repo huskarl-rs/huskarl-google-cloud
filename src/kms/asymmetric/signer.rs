@@ -889,7 +889,12 @@ mod tests {
     #[case(RSA_2048_PUBLIC_KEY_PEM, "PS256", None, jwk::KeyUse::Sign)]
     #[case(ED25519_PUBLIC_KEY_PEM, "Ed25519", Some("ed-kid"), jwk::KeyUse::Sign)]
     #[case(ED25519_PUBLIC_KEY_PEM, "EdDSA", Some("ed-kid"), jwk::KeyUse::Sign)]
-    #[case(RSA_2048_PUBLIC_KEY_PEM, "RSA-OAEP-256", Some("enc-kid"), jwk::KeyUse::Encrypt)]
+    #[case(
+        RSA_2048_PUBLIC_KEY_PEM,
+        "RSA-OAEP-256",
+        Some("enc-kid"),
+        jwk::KeyUse::Encrypt
+    )]
     fn parse_public_key_pem_succeeds(
         #[case] pem: &str,
         #[case] algorithm: &str,
@@ -947,9 +952,18 @@ mod tests {
     #[rstest]
     #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep2048Sha1, Some("RSA-OAEP"))]
     #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha1, Some("RSA-OAEP"))]
-    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep2048Sha256, Some("RSA-OAEP-256"))]
-    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha256, Some("RSA-OAEP-256"))]
-    #[case(CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha512, Some("RSA-OAEP-512"))]
+    #[case(
+        CryptoKeyVersionAlgorithm::RsaDecryptOaep2048Sha256,
+        Some("RSA-OAEP-256")
+    )]
+    #[case(
+        CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha256,
+        Some("RSA-OAEP-256")
+    )]
+    #[case(
+        CryptoKeyVersionAlgorithm::RsaDecryptOaep4096Sha512,
+        Some("RSA-OAEP-512")
+    )]
     #[case(CryptoKeyVersionAlgorithm::EcSignP256Sha256, None)] // signing key, not JWE
     #[case(CryptoKeyVersionAlgorithm::RsaSignPss2048Sha256, None)]
     fn get_jwe_algorithm_maps_encryption_algorithms(
@@ -965,7 +979,8 @@ mod tests {
 
         let sk = SigningKey::from_slice(&[1u8; 32]).unwrap();
         let sig: Signature = sk.sign(b"message");
-        let fixed = convert_ecdsa_der_to_fixed(sig.to_der().as_bytes(), EcDsaVariant::P256).unwrap();
+        let fixed =
+            convert_ecdsa_der_to_fixed(sig.to_der().as_bytes(), EcDsaVariant::P256).unwrap();
 
         assert_eq!(fixed.len(), 64); // r || s, 32 bytes each
         assert_eq!(fixed, sig.to_bytes().to_vec());
@@ -977,7 +992,8 @@ mod tests {
 
         let sk = SigningKey::from_slice(&[1u8; 48]).unwrap();
         let sig: Signature = sk.sign(b"message");
-        let fixed = convert_ecdsa_der_to_fixed(sig.to_der().as_bytes(), EcDsaVariant::P384).unwrap();
+        let fixed =
+            convert_ecdsa_der_to_fixed(sig.to_der().as_bytes(), EcDsaVariant::P384).unwrap();
 
         assert_eq!(fixed.len(), 96); // r || s, 48 bytes each
         assert_eq!(fixed, sig.to_bytes().to_vec());

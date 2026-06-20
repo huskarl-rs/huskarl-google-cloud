@@ -98,8 +98,8 @@ impl From<SigningError> for huskarl_core::Error {
 /// A signing key bound to a specific Cloud KMS HMAC key version.
 ///
 /// This is the lowest-level signing primitive: it holds a reference to a
-/// specific `CryptoKeyVersion` resource and delegates all MAC signing
-/// operations to Cloud KMS.
+/// specific `CryptoKeyVersion` resource and delegates MAC signing and
+/// verification to Cloud KMS.
 ///
 /// Implements [`JwsSigner`], [`JwsSignerSelector`] (selects itself), and
 /// [`JwsVerifier`].
@@ -232,9 +232,11 @@ impl JwsVerifier for KeyVersion {
 
 // ─── SigningKey ───────────────────────────────────────────────────────────────
 
-/// A Cloud KMS HMAC signing key bound to a specific key version.
+/// A Cloud KMS HMAC signing key.
 ///
-/// Implements [`JwsSigner`] and [`JwsSignerSelector`].
+/// Resolves a single key version using the configured [`VersionStrategy`] at
+/// build time, then signs JWS with it via Cloud KMS. Implements [`JwsSigner`]
+/// and [`JwsSignerSelector`].
 ///
 /// # Examples
 ///

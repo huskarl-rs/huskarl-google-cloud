@@ -55,7 +55,10 @@ impl std::fmt::Debug for Jwks {
 
 #[bon]
 impl Jwks {
-    /// Create a new `Jwks` from a Cloud KMS crypto key resource name.
+    /// Creates a `Jwks` from a Cloud KMS crypto key resource name.
+    ///
+    /// Captures configuration only — no I/O happens here (unlike the signer
+    /// builders); call [`fetch`](Self::fetch) to retrieve the public keys.
     #[builder(finish_fn = build)]
     #[allow(clippy::type_complexity)]
     pub fn builder(
