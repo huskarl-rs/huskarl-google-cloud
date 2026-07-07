@@ -195,14 +195,7 @@ impl JwsSigner for KeyVersion {
 
 impl JwsVerifier for KeyVersion {
     fn key_match(&self, key_match: &KeyMatch<'_>) -> Option<KeyMatchStrength> {
-        if key_match.alg != self.jws_algorithm {
-            return None;
-        }
-        match (key_match.kid, self.key_id.as_deref()) {
-            (Some(jwt_kid), Some(my_kid)) if jwt_kid != my_kid => None,
-            (Some(_), Some(_)) => Some(KeyMatchStrength::ByKeyId),
-            _ => Some(KeyMatchStrength::ByAlgorithm),
-        }
+        key_match.strength_for(&[&self.jws_algorithm], self.key_id.as_deref())
     }
 
     fn verify<'a>(

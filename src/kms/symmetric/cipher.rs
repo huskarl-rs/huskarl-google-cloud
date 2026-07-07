@@ -214,16 +214,7 @@ impl AeadEncryptor for KeyVersion {
 
 impl AeadDecryptor for KeyVersion {
     fn cipher_match(&self, m: &CipherMatch<'_>) -> Option<KeyMatchStrength> {
-        if let Some(enc) = m.enc
-            && enc != self.enc_algorithm
-        {
-            return None;
-        }
-        match (m.kid, self.key_id.as_deref()) {
-            (Some(jwt_kid), Some(my_kid)) if jwt_kid != my_kid => None,
-            (Some(_), Some(_)) => Some(KeyMatchStrength::ByKeyId),
-            _ => Some(KeyMatchStrength::ByAlgorithm),
-        }
+        m.strength_for(&self.enc_algorithm, self.key_id.as_deref())
     }
 
     fn decrypt<'a>(
