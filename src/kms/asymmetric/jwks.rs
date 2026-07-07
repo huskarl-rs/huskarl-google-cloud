@@ -1,13 +1,13 @@
 //! JWKS fetching for asymmetric Cloud KMS keys.
 
-use std::sync::Arc;
-
 use bon::bon;
 use google_cloud_kms_v1::client::KeyManagementService;
 use huskarl_core::jwk::PublicJwks;
 use snafu::prelude::*;
 
 use huskarl_core::jwk;
+
+use crate::kid::VersionKid;
 
 use super::signer::{
     PublicKeyParseError, get_jwe_algorithm, get_jws_algorithm, parse_public_key_pem,
@@ -37,11 +37,10 @@ use super::signer::{
 /// # }
 /// ```
 #[derive(Clone)]
-#[allow(clippy::type_complexity)]
 pub struct Jwks {
     kms_client: KeyManagementService,
     key_name: String,
-    with_kid_from_key_version: Option<Arc<dyn Fn(&str) -> String + Send + Sync>>,
+    kid: VersionKid,
     max_versions: Option<usize>,
 }
 
@@ -60,16 +59,16 @@ impl Jwks {
     /// Captures configuration only — no I/O happens here (unlike the signer
     /// builders); call [`fetch`](Self::fetch) to retrieve the public keys.
     #[builder(finish_fn = build)]
-    #[allow(clippy::type_complexity)]
     pub fn builder(
         /// The full resource name of the crypto key.
         #[builder(into)]
         key_name: String,
         /// The KMS client used for operations.
         kms_client: KeyManagementService,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<Arc<dyn Fn(&str) -> String + Send + Sync>>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
         /// Maximum number of enabled versions to include in the JWKS.
         ///
         /// When set, at most this many versions are fetched (newest-first).
@@ -83,7 +82,7 @@ impl Jwks {
         Self {
             kms_client,
             key_name,
-            with_kid_from_key_version,
+            kid,
             max_versions,
         }
     }
@@ -117,10 +116,7 @@ impl Jwks {
                 };
                 let version_id =
                     super::super::version::version_id_from_resource_name(&version.name);
-                let kid = self
-                    .with_kid_from_key_version
-                    .as_ref()
-                    .map(|f| f(version_id));
+                let kid = self.kid.derive(version_id);
                 let name = &version.name;
                 let kms_client = &self.kms_client;
 

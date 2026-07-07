@@ -22,8 +22,8 @@ google-cloud-kms-v1 = { version = "1.4", optional = true, default-features = fal
 google-cloud-secretmanager-v1 = { version = "1.4", optional = true, default-features = false }
 der = { version = "0.8", optional = true, default-features = false, features = ["derive"] }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
-p256 = { version = "=0.14.0-rc.12", optional = true, default-features = false, features = ["ecdsa", "pem"] }
-p384 = { version = "=0.14.0-rc.12", optional = true, default-features = false, features = ["ecdsa", "pem"] }
+p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdsa", "pem"] }
+p384 = { version = "0.14", optional = true, default-features = false, features = ["ecdsa", "pem"] }
 pem-rfc7468 = { version = "1", optional = true, default-features = false }
 snafu = { version = "0.9", default-features = false, features = ["std", "rust_1_81"] }
 spki = { version = "0.8", optional = true, default-features = false }
@@ -33,3 +33,18 @@ rstest = { version = "0.26", default-features = false }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
 google-cloud-gax = { version = "1", default-features = false }
 google-cloud-wkt = { version = "1", default-features = false }
+# Local in-memory key types (AesGcmKey, SymmetricKey), used to prove the
+# multi-version secret sources compose into cipher/verifier constructs with a
+# kid derived from the secret version.
+huskarl-crypto-native = { version = "0.8", default-features = false }
+
+# Local override to build against the in-development 0.9 resource-server (which
+# makes AccessTokenValidator dyn-safe). The whole huskarl family is patched
+# together so a single huskarl-core is used (otherwise ReqwestClient's HttpClient
+# impl wouldn't match). Remove when 0.9 is published.
+[patch.crates-io]
+huskarl-resource-server = { path = "../huskarl/huskarl-resource-server" }
+huskarl = { path = "../huskarl/huskarl" }
+huskarl-core = { path = "../huskarl/huskarl-core" }
+huskarl-crypto-native = { path = "../huskarl/huskarl-crypto-native" }
+huskarl-reqwest = { path = "../huskarl/huskarl-reqwest" }

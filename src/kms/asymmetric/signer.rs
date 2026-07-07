@@ -20,7 +20,7 @@ use snafu::prelude::*;
 
 use super::super::version::VersionStrategy;
 
-type KidMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
+use crate::kid::VersionKid;
 
 /// Errors that can occur when creating a key.
 #[derive(Debug, Snafu)]
@@ -223,23 +223,25 @@ impl KeyVersion {
         /// [RFC 9864]: https://www.rfc-editor.org/rfc/rfc9864
         #[builder(default = true)]
         use_fully_specified_jws_algorithm: bool,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
     ) -> Result<Self, SetupError> {
         build_key_version(
             resource_name,
             kms_client,
             use_fully_specified_jws_algorithm,
-            with_kid_from_key_version,
+            kid,
         )
         .await
     }
 }
 
 impl JwsSignerSelector for KeyVersion {
-    fn select_signer(&self) -> Arc<dyn JwsSigner> {
-        Arc::new(self.clone())
+    fn select_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn JwsSigner>> {
+        let signer: Arc<dyn JwsSigner> = Arc::new(self.clone());
+        Box::pin(async move { signer })
     }
 }
 
@@ -289,19 +291,21 @@ impl JwsSigner for KeyVersion {
 }
 
 impl AsymmetricJwsSignerSelector for KeyVersion {
-    fn select_asymmetric_signer(&self) -> Arc<dyn AsymmetricJwsSigner> {
-        Arc::new(self.clone())
+    fn select_asymmetric_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AsymmetricJwsSigner>> {
+        let signer: Arc<dyn AsymmetricJwsSigner> = Arc::new(self.clone());
+        Box::pin(async move { signer })
     }
 
-    fn select_signer_by_thumbprint(
-        &self,
-        thumbprint: &str,
-    ) -> Option<Arc<dyn AsymmetricJwsSigner>> {
-        if self.thumbprint == thumbprint {
+    fn select_signer_by_thumbprint<'a>(
+        &'a self,
+        thumbprint: &'a str,
+    ) -> MaybeSendBoxFuture<'a, Option<Arc<dyn AsymmetricJwsSigner>>> {
+        let signer: Option<Arc<dyn AsymmetricJwsSigner>> = if self.thumbprint == thumbprint {
             Some(Arc::new(self.clone()))
         } else {
             None
-        }
+        };
+        Box::pin(async move { signer })
     }
 }
 
@@ -399,9 +403,10 @@ impl SigningKey {
         /// [RFC 9864]: https://www.rfc-editor.org/rfc/rfc9864
         #[builder(default = true)]
         use_fully_specified_jws_algorithm: bool,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
         /// Maximum number of enabled versions to load.
         ///
         /// When set, at most this many versions are fetched (newest-first).
@@ -435,7 +440,7 @@ impl SigningKey {
 
         let primary_resource_name = format!("{key_name}/cryptoKeyVersions/{primary_version_id}");
         let kms_ref = &kms_client;
-        let kid_mapper = with_kid_from_key_version.as_ref();
+        let kid_ref = &kid;
 
         // Fetch public keys for all enabled signing-capable versions concurrently.
         let futures: Vec<_> = all_versions
@@ -444,7 +449,7 @@ impl SigningKey {
                 let alg = get_jws_algorithm(&version.algorithm)?;
                 let version_id =
                     super::super::version::version_id_from_resource_name(&version.name);
-                let kid = kid_mapper.map(|f| f(version_id));
+                let kid = kid_ref.derive(version_id);
                 let name = &version.name;
 
                 Some(async move {
@@ -506,27 +511,32 @@ impl SigningKey {
 }
 
 impl JwsSignerSelector for SigningKey {
-    fn select_signer(&self) -> Arc<dyn JwsSigner> {
-        Arc::new(self.primary.clone())
+    fn select_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn JwsSigner>> {
+        let signer: Arc<dyn JwsSigner> = Arc::new(self.primary.clone());
+        Box::pin(async move { signer })
     }
 }
 
 impl AsymmetricJwsSignerSelector for SigningKey {
-    fn select_asymmetric_signer(&self) -> Arc<dyn AsymmetricJwsSigner> {
-        Arc::new(self.primary.clone())
+    fn select_asymmetric_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AsymmetricJwsSigner>> {
+        let signer: Arc<dyn AsymmetricJwsSigner> = Arc::new(self.primary.clone());
+        Box::pin(async move { signer })
     }
 
-    fn select_signer_by_thumbprint(
-        &self,
-        thumbprint: &str,
-    ) -> Option<Arc<dyn AsymmetricJwsSigner>> {
-        if self.primary.thumbprint == thumbprint {
-            return Some(Arc::new(self.primary.clone()));
-        }
-        self.additional
-            .iter()
-            .find(|kv| kv.thumbprint == thumbprint)
-            .map(|kv| Arc::new(kv.clone()) as Arc<dyn AsymmetricJwsSigner>)
+    fn select_signer_by_thumbprint<'a>(
+        &'a self,
+        thumbprint: &'a str,
+    ) -> MaybeSendBoxFuture<'a, Option<Arc<dyn AsymmetricJwsSigner>>> {
+        let signer: Option<Arc<dyn AsymmetricJwsSigner>> = if self.primary.thumbprint == thumbprint
+        {
+            Some(Arc::new(self.primary.clone()))
+        } else {
+            self.additional
+                .iter()
+                .find(|kv| kv.thumbprint == thumbprint)
+                .map(|kv| Arc::new(kv.clone()) as Arc<dyn AsymmetricJwsSigner>)
+        };
+        Box::pin(async move { signer })
     }
 }
 
@@ -536,7 +546,7 @@ async fn build_key_version(
     resource_name: String,
     kms_client: KeyManagementService,
     use_fully_specified_jws_algorithm: bool,
-    with_kid_from_key_version: Option<KidMapper>,
+    kid: VersionKid,
 ) -> Result<KeyVersion, SetupError> {
     // Fetch the public key — this also gives us the algorithm.
     let public_key_response = kms_client
@@ -555,7 +565,7 @@ async fn build_key_version(
         public_key_response.name.clone()
     };
     let version_id = super::super::version::version_id_from_resource_name(&resolved_name);
-    let key_id = with_kid_from_key_version.map(|f| f(version_id));
+    let key_id = kid.derive(version_id);
 
     let jws_algorithm = get_jws_algorithm(&public_key_response.algorithm).with_context(|| {
         UnsupportedAlgorithmSnafu {

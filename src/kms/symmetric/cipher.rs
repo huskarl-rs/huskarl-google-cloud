@@ -23,7 +23,7 @@ use super::{
 };
 pub use super::{KeyError, SetupError};
 
-type KidMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
+use crate::kid::VersionKid;
 
 /// Errors that can occur when encrypting.
 #[derive(Debug, Snafu)]
@@ -148,17 +148,19 @@ impl KeyVersion {
         resource_name: String,
         /// The KMS client used for operations.
         kms_client: KeyManagementService,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
     ) -> Result<Self, SetupError> {
-        build_key_version(resource_name, kms_client, with_kid_from_key_version).await
+        build_key_version(resource_name, kms_client, kid).await
     }
 }
 
 impl AeadCipherSelector for KeyVersion {
-    fn select_cipher(&self) -> Arc<dyn AeadEncryptor> {
-        Arc::new(self.clone())
+    fn select_cipher(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
+        let encryptor: Arc<dyn AeadEncryptor> = Arc::new(self.clone());
+        Box::pin(async move { encryptor })
     }
 }
 
@@ -308,24 +310,21 @@ impl EncryptionKey {
         /// The version selection strategy. Defaults to [`VersionStrategy::Latest`].
         #[builder(default)]
         strategy: VersionStrategy,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
     ) -> Result<Self, KeyError> {
-        let key_version = resolve_encryption_key_version(
-            &key_name,
-            &kms_client,
-            &strategy,
-            with_kid_from_key_version.as_ref(),
-        )
-        .await?;
+        let key_version =
+            resolve_encryption_key_version(&key_name, &kms_client, &strategy, &kid).await?;
         Ok(Self { key_version })
     }
 }
 
 impl AeadCipherSelector for EncryptionKey {
-    fn select_cipher(&self) -> Arc<dyn AeadEncryptor> {
-        Arc::new(self.key_version.clone())
+    fn select_cipher(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
+        let encryptor: Arc<dyn AeadEncryptor> = Arc::new(self.key_version.clone());
+        Box::pin(async move { encryptor })
     }
 }
 
@@ -398,9 +397,10 @@ impl DecryptionKey {
         key_name: String,
         /// The KMS client used for operations.
         kms_client: KeyManagementService,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
         /// Maximum number of enabled versions to fetch.
         ///
         /// When set, at most this many versions are fetched (newest-first).
@@ -411,13 +411,8 @@ impl DecryptionKey {
         /// paged requests).
         max_versions: Option<usize>,
     ) -> Result<Self, KeyError> {
-        let versions = resolve_decryption_key_versions(
-            &key_name,
-            &kms_client,
-            with_kid_from_key_version.as_ref(),
-            max_versions,
-        )
-        .await?;
+        let versions =
+            resolve_decryption_key_versions(&key_name, &kms_client, &kid, max_versions).await?;
         let decryptor = Arc::new(MultiKeyDecryptor::new(
             versions
                 .into_iter()
@@ -510,9 +505,10 @@ impl CipherKey {
         /// The version selection strategy for encryption. Defaults to [`VersionStrategy::Latest`].
         #[builder(default)]
         strategy: VersionStrategy,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
         /// Maximum number of enabled versions to fetch for decryption.
         ///
         /// When set, at most this many versions are fetched (newest-first).
@@ -523,10 +519,9 @@ impl CipherKey {
         /// paged requests).
         max_versions: Option<usize>,
     ) -> Result<Self, KeyError> {
-        let kid_mapper = with_kid_from_key_version.as_ref();
         let (enc_kv, dec_kvs) = futures_util::try_join!(
-            resolve_encryption_key_version(&key_name, &kms_client, &strategy, kid_mapper),
-            resolve_decryption_key_versions(&key_name, &kms_client, kid_mapper, max_versions),
+            resolve_encryption_key_version(&key_name, &kms_client, &strategy, &kid),
+            resolve_decryption_key_versions(&key_name, &kms_client, &kid, max_versions),
         )?;
         let encryption = EncryptionKey {
             key_version: enc_kv,
@@ -547,8 +542,9 @@ impl CipherKey {
 }
 
 impl AeadCipherSelector for CipherKey {
-    fn select_cipher(&self) -> Arc<dyn AeadEncryptor> {
-        Arc::new(self.encryption.key_version.clone())
+    fn select_cipher(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
+        let encryptor: Arc<dyn AeadEncryptor> = Arc::new(self.encryption.key_version.clone());
+        Box::pin(async move { encryptor })
     }
 }
 
@@ -594,7 +590,7 @@ async fn resolve_encryption_key_version(
     key_name: &str,
     kms_client: &KeyManagementService,
     strategy: &VersionStrategy,
-    kid_mapper: Option<&KidMapper>,
+    kid: &VersionKid,
 ) -> Result<KeyVersion, KeyError> {
     let version_id = version::resolve_version(key_name, strategy, kms_client)
         .await
@@ -616,7 +612,7 @@ async fn resolve_encryption_key_version(
         kv_response.name
     };
     let vid = version::version_id_from_resource_name(&resolved_name);
-    let key_id = kid_mapper.map(|f| f(vid));
+    let key_id = kid.derive(vid);
 
     let enc_algorithm = get_enc_algorithm(&kv_response.algorithm).ok_or_else(|| {
         UnsupportedAlgorithmSnafu {
@@ -636,7 +632,7 @@ async fn resolve_encryption_key_version(
 async fn resolve_decryption_key_versions(
     key_name: &str,
     kms_client: &KeyManagementService,
-    kid_mapper: Option<&KidMapper>,
+    kid: &VersionKid,
     max_versions: Option<usize>,
 ) -> Result<Vec<KeyVersion>, KeyError> {
     let raw =
@@ -651,7 +647,7 @@ async fn resolve_decryption_key_versions(
         .filter_map(|v| {
             let enc_algorithm = get_enc_algorithm(&v.algorithm)?;
             let vid = version::version_id_from_resource_name(&v.name);
-            let key_id = kid_mapper.map(|f| f(vid));
+            let key_id = kid.derive(vid);
             Some(KeyVersion {
                 kms_client: kms_client.clone(),
                 resource_name: v.name.clone(),
@@ -665,7 +661,7 @@ async fn resolve_decryption_key_versions(
 async fn build_key_version(
     resource_name: String,
     kms_client: KeyManagementService,
-    with_kid_from_key_version: Option<KidMapper>,
+    kid: VersionKid,
 ) -> Result<KeyVersion, SetupError> {
     let kv_response = kms_client
         .get_crypto_key_version()
@@ -681,7 +677,7 @@ async fn build_key_version(
         kv_response.name
     };
     let version_id = version::version_id_from_resource_name(&resolved_name);
-    let key_id = with_kid_from_key_version.map(|f| f(version_id));
+    let key_id = kid.derive(version_id);
 
     let enc_algorithm =
         get_enc_algorithm(&kv_response.algorithm).context(setup::UnsupportedAlgorithmSnafu {

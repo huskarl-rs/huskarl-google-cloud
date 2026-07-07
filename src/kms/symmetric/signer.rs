@@ -21,7 +21,7 @@ use super::{
 };
 pub use super::{KeyError, SetupError};
 
-type KidMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
+use crate::kid::VersionKid;
 
 /// Errors that can occur when signing.
 #[derive(Debug, Snafu)]
@@ -145,17 +145,19 @@ impl KeyVersion {
         resource_name: String,
         /// The KMS client used for operations.
         kms_client: KeyManagementService,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
     ) -> Result<Self, SetupError> {
-        build_key_version(resource_name, kms_client, with_kid_from_key_version).await
+        build_key_version(resource_name, kms_client, kid).await
     }
 }
 
 impl JwsSignerSelector for KeyVersion {
-    fn select_signer(&self) -> Arc<dyn JwsSigner> {
-        Arc::new(self.clone())
+    fn select_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn JwsSigner>> {
+        let signer: Arc<dyn JwsSigner> = Arc::new(self.clone());
+        Box::pin(async move { signer })
     }
 }
 
@@ -281,9 +283,10 @@ impl SigningKey {
         /// The version selection strategy. Defaults to [`VersionStrategy::Latest`].
         #[builder(default)]
         strategy: VersionStrategy,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
     ) -> Result<Self, KeyError> {
         let version_id = version::resolve_version(&key_name, &strategy, &kms_client)
             .await
@@ -305,7 +308,7 @@ impl SigningKey {
             kv_response.name
         };
         let vid = version::version_id_from_resource_name(&resolved_name);
-        let key_id = with_kid_from_key_version.as_ref().map(|f| f(vid));
+        let key_id = kid.derive(vid);
 
         let jws_algorithm = get_jws_algorithm(&kv_response.algorithm).ok_or_else(|| {
             UnsupportedAlgorithmSnafu {
@@ -326,8 +329,9 @@ impl SigningKey {
 }
 
 impl JwsSignerSelector for SigningKey {
-    fn select_signer(&self) -> Arc<dyn JwsSigner> {
-        Arc::new(self.key_version.clone())
+    fn select_signer(&self) -> MaybeSendBoxFuture<'_, Arc<dyn JwsSigner>> {
+        let signer: Arc<dyn JwsSigner> = Arc::new(self.key_version.clone());
+        Box::pin(async move { signer })
     }
 }
 
@@ -393,9 +397,10 @@ impl VerifyingKey {
         key_name: String,
         /// The KMS client used for operations.
         kms_client: KeyManagementService,
-        /// Derive a kid value from the key version ID.
-        #[builder(with = |f: impl Fn(&str) -> String + Send + Sync + 'static| Arc::new(f))]
-        with_kid_from_key_version: Option<KidMapper>,
+        /// How to derive a `kid` from the key version ID. Defaults to
+        /// [`VersionKid::none()`] (no `kid`).
+        #[builder(default = VersionKid::none())]
+        kid: VersionKid,
         /// Maximum number of enabled versions to fetch.
         ///
         /// When set, at most this many versions are fetched (newest-first).
@@ -421,7 +426,7 @@ impl VerifyingKey {
             .filter_map(|v| {
                 let jws_algorithm = get_jws_algorithm(&v.algorithm)?;
                 let vid = version::version_id_from_resource_name(&v.name);
-                let key_id = with_kid_from_key_version.as_ref().map(|f| f(vid));
+                let key_id = kid.derive(vid);
                 Some(KeyVersion {
                     kms_client: kms_client.clone(),
                     resource_name: v.name.clone(),
@@ -465,7 +470,7 @@ impl JwsVerifier for VerifyingKey {
 async fn build_key_version(
     resource_name: String,
     kms_client: KeyManagementService,
-    with_kid_from_key_version: Option<KidMapper>,
+    kid: VersionKid,
 ) -> Result<KeyVersion, SetupError> {
     let kv_response = kms_client
         .get_crypto_key_version()
@@ -481,7 +486,7 @@ async fn build_key_version(
         kv_response.name
     };
     let version_id = version::version_id_from_resource_name(&resolved_name);
-    let key_id = with_kid_from_key_version.map(|f| f(version_id));
+    let key_id = kid.derive(version_id);
 
     let jws_algorithm =
         get_jws_algorithm(&kv_response.algorithm).context(setup::UnsupportedAlgorithmSnafu {
@@ -598,10 +603,7 @@ mod tests {
         #[case] expected: Option<KeyMatchStrength>,
     ) {
         let kv = key_version(MockKms::default(), "HS256", registered_kid);
-        let m = KeyMatch {
-            alg: req_alg,
-            kid: req_kid,
-        };
+        let m = KeyMatch::builder().alg(req_alg).maybe_kid(req_kid).build();
         assert_eq!(kv.key_match(&m), expected);
     }
 
@@ -635,10 +637,7 @@ mod tests {
             ..Default::default()
         };
         let kv = key_version(mock, "HS256", None);
-        let m = KeyMatch {
-            alg: "HS256",
-            kid: None,
-        };
+        let m = KeyMatch::builder().alg("HS256").build();
         assert!(kv.verify(b"data", b"sig", &m).await.is_ok());
     }
 
@@ -649,10 +648,7 @@ mod tests {
             ..Default::default()
         };
         let kv = key_version(mock, "HS256", None);
-        let m = KeyMatch {
-            alg: "HS256",
-            kid: None,
-        };
+        let m = KeyMatch::builder().alg("HS256").build();
         assert!(matches!(
             kv.verify(b"data", b"sig", &m).await,
             Err(VerifyError::SignatureMismatch)

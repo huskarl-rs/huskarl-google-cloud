@@ -15,6 +15,7 @@
 //!
 //! Each lives behind a cargo feature of the same name.
 
+pub mod kid;
 #[cfg(feature = "kms")]
 pub mod kms;
 #[cfg(feature = "secretmanager")]
