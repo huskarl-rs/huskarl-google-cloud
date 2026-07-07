@@ -59,7 +59,9 @@ impl VersionResolutionError {
 /// Strategy for selecting which key version to use.
 ///
 /// The choice matters for encryption and signing, which pin a single version —
-/// see the [parent module](super) for picking one safely under rotation.
+/// see [key versions and
+/// rotation](crate::_docs::explanation::versions_and_rotation) for picking one
+/// safely under rotation.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum VersionStrategy {
@@ -69,15 +71,17 @@ pub enum VersionStrategy {
     ///
     /// For encryption this is the riskiest choice: a freshly-created version is
     /// used as soon as the encryptor reloads, which can outrun decryptors on
-    /// other servers (see the [parent module](super)). Fine for signing, since
-    /// verifiers load all enabled versions.
+    /// other servers (see [key versions and
+    /// rotation](crate::_docs::explanation::versions_and_rotation)). Fine for
+    /// signing, since verifiers load all enabled versions.
     #[default]
     Latest,
     /// Use the version indicated by a label on the `CryptoKey`.
     ///
     /// The label's value is interpreted as the version ID. Promoting the label
     /// only after every consumer has loaded the new version makes this a
-    /// rotation-safe choice for encryption (see the [parent module](super)).
+    /// rotation-safe choice for encryption (see [key versions and
+    /// rotation](crate::_docs::explanation::versions_and_rotation)).
     ByLabel(String),
     /// Use the newest enabled version whose `create_time` is at least
     /// `min_age` in the past.

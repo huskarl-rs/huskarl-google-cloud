@@ -8,6 +8,13 @@ license = "MIT OR Apache-2.0"
 keywords = ["oauth2", "security", "authentication", "gcp", "google"]
 categories = ["authentication"]
 readme = "README.md"
+documentation = "https://docs.rs/huskarl-google-cloud"
+
+[package.metadata.docs.rs]
+# Render the `_docs` module and enable `doc_cfg` feature badges.
+# `cargo docs-rs` reads this block too.
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = true
 
 [features]
 default = ["kms", "secretmanager"]

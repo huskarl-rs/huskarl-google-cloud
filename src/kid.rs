@@ -11,6 +11,9 @@
 //! [`VersionKid::none()`] (a bare KMS version number is rarely a useful `kid`),
 //! while Secret Manager sources default to [`VersionKid::verbatim()`] (the
 //! secret version is a natural, stable `kid` for rotation).
+//!
+//! For why the `kid` matters and how it drives multi-key selection, see [key
+//! IDs](crate::_docs::explanation::key_ids).
 
 use std::sync::Arc;
 

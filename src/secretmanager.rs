@@ -1,4 +1,9 @@
 //! Google Cloud Secret Manager integration for retrieving secrets.
+//!
+//! [`SecretVersionBytes`] and [`SecretVersion`] read a single version;
+//! [`SecretVersions`] exposes a primary version plus all enabled versions for
+//! key rotation. See the [Secret Manager
+//! guide](crate::_docs::guide::secret_manager).
 
 use bon::Builder;
 use google_cloud_secretmanager_v1::client::SecretManagerService;

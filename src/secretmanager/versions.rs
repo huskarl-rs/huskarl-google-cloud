@@ -99,13 +99,12 @@ impl ActiveSecretVersions {
 ///
 /// Holds no cached state — caching is handled by the caller.
 ///
-/// # Key rotation pattern
-///
-/// 1. Add a new secret version.
-/// 2. Wait for all servers to pick it up via [`all`](Self::all)
-///    and a [`MultiKeyDecryptor`](huskarl_core::crypto::cipher::MultiKeyDecryptor).
-/// 3. Update the primary alias to point to the new version.
-/// 4. Servers will now encrypt with the new key on next refresh.
+/// Rotate by adding a version, waiting for consumers to load it via
+/// [`all`](Self::all) into a
+/// [`MultiKeyDecryptor`](huskarl_core::crypto::cipher::MultiKeyDecryptor), then
+/// repointing the primary alias. See the [Secret Manager
+/// guide](crate::_docs::guide::secret_manager) and [key versions and
+/// rotation](crate::_docs::explanation::versions_and_rotation).
 ///
 /// # Examples
 ///

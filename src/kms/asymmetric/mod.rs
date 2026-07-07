@@ -5,7 +5,9 @@
 //! - [`jwks`] — a [`Jwks`] provider that serves the key's public versions to
 //!   verifiers.
 //!
-//! See the [parent module](super) for the version and rotation model.
+//! See [key versions and
+//! rotation](crate::_docs::explanation::versions_and_rotation) for the version
+//! and rotation model, and the [signing guide](crate::_docs::guide::asymmetric_signing).
 
 pub mod jwks;
 pub mod signer;

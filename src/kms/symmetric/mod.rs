@@ -4,8 +4,10 @@
 //! - [`signer`] — HMAC signing and verification (`MAC` key purpose)
 //!
 //! Encryption and signing pin a single key version; decryption and verification
-//! span all enabled versions. See the [parent module](super) for the version
-//! and rotation model.
+//! span all enabled versions. See [key versions and
+//! rotation](crate::_docs::explanation::versions_and_rotation) for the version
+//! and rotation model, and the [symmetric crypto
+//! guide](crate::_docs::guide::symmetric_crypto).
 
 pub mod cipher;
 pub mod signer;
