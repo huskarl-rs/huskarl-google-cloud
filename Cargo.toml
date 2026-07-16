@@ -22,7 +22,7 @@ kms = ["dep:google-cloud-kms-v1", "dep:p256", "dep:p384", "dep:der", "dep:pem-rf
 secretmanager = ["dep:google-cloud-secretmanager-v1", "dep:futures-util"]
 
 [dependencies]
-huskarl-core = { version = "0.7", default-features = false }
+huskarl-core = { version = "0.8", default-features = false }
 
 bon = { version = "3", default-features = false }
 google-cloud-kms-v1 = { version = "1.4", optional = true, default-features = false }
@@ -43,15 +43,4 @@ google-cloud-wkt = { version = "1", default-features = false }
 # Local in-memory key types (AesGcmKey, SymmetricKey), used to prove the
 # multi-version secret sources compose into cipher/verifier constructs with a
 # kid derived from the secret version.
-huskarl-crypto-native = { version = "0.8", default-features = false }
-
-# Local override to build against the in-development 0.9 resource-server (which
-# makes AccessTokenValidator dyn-safe). The whole huskarl family is patched
-# together so a single huskarl-core is used (otherwise ReqwestClient's HttpClient
-# impl wouldn't match). Remove when 0.9 is published.
-[patch.crates-io]
-huskarl-resource-server = { path = "../huskarl/huskarl-resource-server" }
-huskarl = { path = "../huskarl/huskarl" }
-huskarl-core = { path = "../huskarl/huskarl-core" }
-huskarl-crypto-native = { path = "../huskarl/huskarl-crypto-native" }
-huskarl-reqwest = { path = "../huskarl/huskarl-reqwest" }
+huskarl-crypto-native = { version = "0.9", default-features = false }
