@@ -59,6 +59,35 @@ pub enum SetupError {
     PrimaryVersionNotFound,
 }
 
+impl SetupError {
+    /// If true, the failure is transient and the operation may succeed if retried.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            SetupError::VersionResolution { source } => source.is_retryable(),
+            SetupError::GetPublicKey { source } | SetupError::ListCryptoKeyVersions { source } => {
+                source.is_timeout() || source.is_exhausted()
+            }
+            SetupError::UnsupportedAlgorithm { .. }
+            | SetupError::InvalidKeyVersionName
+            | SetupError::PublicKeyParse { .. }
+            | SetupError::NoEnabledCryptoKeyVersions
+            | SetupError::PrimaryVersionNotFound => false,
+        }
+    }
+}
+
+impl From<SetupError> for huskarl_core::Error {
+    fn from(err: SetupError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
+    }
+}
+
 /// Errors that can occur when parsing a public key PEM into a JWK.
 #[derive(Debug, Snafu)]
 #[non_exhaustive]
@@ -1014,6 +1043,20 @@ mod tests {
         assert!(!SigningError::MismatchedKeyInfo.is_retryable());
         assert_eq!(
             huskarl_core::Error::from(SigningError::MismatchedKeyInfo).kind(),
+            ErrorKind::Crypto
+        );
+    }
+
+    #[test]
+    fn setup_error_classifies_by_retryability() {
+        // A non-retryable setup failure maps to `Crypto` so a refresh factory
+        // (e.g. `ScheduledRefreshSigner`) surfaces a permanent build error.
+        let permanent = SetupError::UnsupportedAlgorithm {
+            algorithm: CryptoKeyVersionAlgorithm::default(),
+        };
+        assert!(!permanent.is_retryable());
+        assert_eq!(
+            huskarl_core::Error::from(permanent).kind(),
             ErrorKind::Crypto
         );
     }
