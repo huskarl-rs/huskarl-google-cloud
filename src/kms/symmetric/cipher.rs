@@ -9,7 +9,7 @@ use google_cloud_kms_v1::{
 };
 use huskarl_core::crypto::KeyMatchStrength;
 use huskarl_core::crypto::cipher::{
-    AeadCipherSelector, AeadDecryptor, AeadEncryptor, AeadOutput, CipherMatch, DecryptError,
+    AeadDecryptor, AeadEncryptor, AeadEncryptorSelector, AeadOutput, CipherMatch, DecryptError,
     MultiKeyDecryptor,
 };
 use huskarl_core::platform::MaybeSendBoxFuture;
@@ -103,7 +103,7 @@ impl From<DecryptionError> for huskarl_core::Error {
 /// specific `CryptoKeyVersion` resource and delegates all raw encrypt/decrypt
 /// operations to Cloud KMS.
 ///
-/// Implements [`AeadEncryptor`], [`AeadDecryptor`], and [`AeadCipherSelector`]
+/// Implements [`AeadEncryptor`], [`AeadDecryptor`], and [`AeadEncryptorSelector`]
 /// (selects itself).
 ///
 /// # Examples
@@ -157,8 +157,8 @@ impl KeyVersion {
     }
 }
 
-impl AeadCipherSelector for KeyVersion {
-    fn select_cipher(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
+impl AeadEncryptorSelector for KeyVersion {
+    fn select_encryptor(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
         let encryptor: Arc<dyn AeadEncryptor> = Arc::new(self.clone());
         Box::pin(async move { encryptor })
     }
@@ -256,7 +256,7 @@ impl AeadDecryptor for KeyVersion {
 /// Resolves a key version using the configured [`VersionStrategy`],
 /// then delegates encryption to the resolved [`KeyVersion`].
 ///
-/// Implements [`AeadEncryptor`] and [`AeadCipherSelector`].
+/// Implements [`AeadEncryptor`] and [`AeadEncryptorSelector`].
 ///
 /// # Examples
 ///
@@ -312,8 +312,8 @@ impl EncryptionKey {
     }
 }
 
-impl AeadCipherSelector for EncryptionKey {
-    fn select_cipher(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
+impl AeadEncryptorSelector for EncryptionKey {
+    fn select_encryptor(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
         let encryptor: Arc<dyn AeadEncryptor> = Arc::new(self.key_version.clone());
         Box::pin(async move { encryptor })
     }
@@ -440,7 +440,7 @@ impl AeadDecryptor for DecryptionKey {
 /// [`VersionStrategy`], and decrypts with all enabled versions to support
 /// key rotation.
 ///
-/// Implements [`AeadEncryptor`], [`AeadCipherSelector`], and [`AeadDecryptor`].
+/// Implements [`AeadEncryptor`], [`AeadEncryptorSelector`], and [`AeadDecryptor`].
 /// Both sides are constructed concurrently.
 ///
 /// # Examples
@@ -532,8 +532,8 @@ impl CipherKey {
     }
 }
 
-impl AeadCipherSelector for CipherKey {
-    fn select_cipher(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
+impl AeadEncryptorSelector for CipherKey {
+    fn select_encryptor(&self) -> MaybeSendBoxFuture<'_, Arc<dyn AeadEncryptor>> {
         let encryptor: Arc<dyn AeadEncryptor> = Arc::new(self.encryption.key_version.clone());
         Box::pin(async move { encryptor })
     }

@@ -328,9 +328,9 @@ mod crypto_composition {
     };
     use google_cloud_secretmanager_v1::stub::SecretManagerService as SmStub;
     use huskarl_core::crypto::cipher::{
-        AeadDecryptor, AeadEncryptor, CipherMatch, MultiKeyDecryptor,
+        AeadDecryptor, AeadEncryptor, AeadEncryptorSelector, CipherMatch, MultiKeyDecryptor,
     };
-    use huskarl_core::crypto::signer::JwsSigner;
+    use huskarl_core::crypto::signer::{JwsSigner, JwsSignerSelector};
     use huskarl_core::crypto::verifier::{JwsVerifier, KeyMatch, MultiKeyVerifier};
     use huskarl_core::jwk::{JwkJson, OctBytes};
     use huskarl_core::secrets::Secret;
@@ -423,7 +423,9 @@ mod crypto_composition {
         // Encryptor from the primary — its kid is the primary version.
         let enc = AesGcmKey::from_secret(active.primary.clone().mapped(OctBytes::new("A256GCM")))
             .await
-            .unwrap();
+            .unwrap()
+            .select_encryptor()
+            .await;
         assert_eq!(enc.key_id().as_deref(), Some("3"));
 
         // Decryptor spanning every enabled version, each keyed by its version.
@@ -478,7 +480,9 @@ mod crypto_composition {
             .unwrap();
         let signer = SymmetricKey::from_secret(v2.clone().mapped(OctBytes::new("HS256")))
             .await
-            .unwrap();
+            .unwrap()
+            .select_signer()
+            .await;
         assert_eq!(signer.key_id().as_deref(), Some("2"));
 
         // Verifier spanning every enabled version.
@@ -529,7 +533,9 @@ mod crypto_composition {
                 .mapped(JwkJson),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .select_signer()
+        .await;
 
         // The JWK's own kid and alg win — the version "5" does not clobber them.
         assert_eq!(key.key_id().as_deref(), Some("jwk-sym-1"));

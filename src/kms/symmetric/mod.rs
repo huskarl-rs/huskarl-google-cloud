@@ -49,6 +49,17 @@ impl SetupError {
     }
 }
 
+impl From<SetupError> for huskarl_core::Error {
+    fn from(err: SetupError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
+    }
+}
+
 /// Errors that can occur when resolving key versions via the higher-level key
 /// builders (e.g. [`cipher::CipherKey`], [`signer::SigningKey`]).
 #[derive(Debug, Snafu)]
@@ -91,5 +102,48 @@ impl KeyError {
             }
             KeyError::UnsupportedAlgorithm { .. } | KeyError::NoEnabledCryptoKeyVersions => false,
         }
+    }
+}
+
+impl From<KeyError> for huskarl_core::Error {
+    fn from(err: KeyError) -> Self {
+        let kind = if err.is_retryable() {
+            huskarl_core::ErrorKind::Transport { retryable: true }
+        } else {
+            huskarl_core::ErrorKind::Crypto
+        };
+        huskarl_core::Error::new(kind, err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use huskarl_core::ErrorKind;
+
+    // Build errors funnel into `huskarl_core::Error` so builders compose as the
+    // factory of a `ScheduledRefreshCipher` / `ScheduledRefreshSigner`, whose
+    // factory returns `Result<_, huskarl_core::Error>`.
+
+    #[test]
+    fn key_error_classifies_by_retryability() {
+        // A permanent failure (no enabled versions) is `Crypto`.
+        assert!(!KeyError::NoEnabledCryptoKeyVersions.is_retryable());
+        assert_eq!(
+            huskarl_core::Error::from(KeyError::NoEnabledCryptoKeyVersions).kind(),
+            ErrorKind::Crypto
+        );
+    }
+
+    #[test]
+    fn setup_error_classifies_by_retryability() {
+        let permanent = SetupError::UnsupportedAlgorithm {
+            algorithm: CryptoKeyVersionAlgorithm::default(),
+        };
+        assert!(!permanent.is_retryable());
+        assert_eq!(
+            huskarl_core::Error::from(permanent).kind(),
+            ErrorKind::Crypto
+        );
     }
 }
